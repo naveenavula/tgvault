@@ -15,7 +15,6 @@ Chrome / Edge extension that stores photos and files in your own **Telegram Save
    ```json
    { "api_id": "1234567", "api_hash": "0123456789abcdef0123456789abcdef" }
    ```
-   **Do not commit your real `api_hash` to a public repo.** If you leave the file blank, the extension asks for the values on first run.
 5. Click the TGVault icon, log in with your phone number and code, and create your encryption passphrase.
 
 ## Build from source (optional, needs Node 18+)
