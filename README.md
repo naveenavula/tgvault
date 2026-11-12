@@ -7,18 +7,22 @@ Chrome / Edge extension that stores photos and files in your own **Telegram Save
 - Folders, search, preview, drag & drop, live sync with Saved Messages
 - Share any file as a single password-locked `.html` file (AES-256-GCM, opens in any browser, ≤150 MB)
 
-## Setup
-1. Register a Telegram app at https://my.telegram.org/apps and put the values in `static/credentials.json`:
+## Install (no Node/npm needed)
+1. Download this repo (**Code → Download ZIP**) and unzip it.
+2. Open `chrome://extensions` (or `edge://extensions`) and enable **Developer mode**.
+3. Click **Load unpacked** and choose the **`extension`** folder (the one that directly contains `manifest.json`).
+4. Put your Telegram app credentials in `extension/credentials.json` (free, from https://my.telegram.org/apps), then click the reload arrow on the extension:
    ```json
    { "api_id": "1234567", "api_hash": "0123456789abcdef0123456789abcdef" }
    ```
-   **Do not commit your real `api_hash` to a public repo.**
-2. Build (Node 18+):
-   ```
-   npm install
-   npm run build
-   ```
-3. Open `chrome://extensions` (or `edge://extensions`), enable Developer mode, **Load unpacked**, choose the `dist/` folder.
+   **Do not commit your real `api_hash` to a public repo.** If you leave the file blank, the extension asks for the values on first run.
+5. Click the TGVault icon, log in with your phone number and code, and create your encryption passphrase.
+
+## Build from source (optional, needs Node 18+)
+```
+npm install
+npm run build        # outputs dist/
+```
 
 ## Security notes
 - Your encryption passphrase cannot be recovered. Use the same passphrase on every device.
