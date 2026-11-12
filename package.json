@@ -8,7 +8,7 @@
     "build": "node build.mjs dist",
     "test": "node test-crypto.mjs && node test-share.mjs"
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "dependencies": {
     "assert": "^2.1.0",
     "big-integer": "^1.6.52",
