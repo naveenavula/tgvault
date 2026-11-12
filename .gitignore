@@ -1,0 +1,7 @@
+node_modules/
+dist/
+dist-mock/
+*.zip
+share-test.*
+# never commit real Telegram API credentials
+static/credentials.local.json

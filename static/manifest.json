@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "TGVault – encrypted Telegram storage",
+  "version": "1.0.0",
+  "description": "Store photos and files in your Telegram Saved Messages, end-to-end encrypted in your browser.",
+  "action": { "default_title": "Open TGVault" },
+  "background": { "service_worker": "background.js" },
+  "permissions": ["storage"],
+  "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:"
+  }
+}
