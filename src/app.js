@@ -1,5 +1,5 @@
 import { TG } from './tg.js';
-import { deriveMasterKey, keyCheck, MAX_THUMB } from './crypto.js';
+import { deriveMasterBits, importMaster, keyCheck, sealString, openString, b64u, unb64u, utf8Len, PATH_MAX_BYTES, MAX_THUMB } from './crypto.js';
 import { buildShareHtml, randomPassword, SHARE_MAX } from './share.js';
 
 const $root = document.getElementById('root');
@@ -16,14 +16,28 @@ const toastEl = document.getElementById('toast'); let toastT;
 function toast(msg) { toastEl.textContent = msg; toastEl.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => toastEl.classList.remove('show'), 3500); }
 const errMsg = (e) => (e && (e.errorMessage || e.message)) || String(e);
 
-// ---------- IndexedDB: holds the non-extractable master key until you lock/log out ----------
-const idb = {
-  open: () => new Promise((res, rej) => { const r = indexedDB.open('tgvault', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }),
-  async get(k) { const db = await this.open(); return new Promise((res, rej) => { const q = db.transaction('kv').objectStore('kv').get(k); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); },
-  async set(k, v) { const db = await this.open(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }); },
-  async del(k) { const db = await this.open(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').delete(k); t.oncomplete = res; t.onerror = () => rej(t.error); }); },
-  async clear() { const db = await this.open(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').clear(); t.oncomplete = res; t.onerror = () => rej(t.error); }); },
-};
+// ---------- secrets ----------
+// The encryption key is remembered only in chrome.storage.session: browser memory that is never written to disk and is
+// wiped when the browser closes. So the passphrase is asked again after every browser restart and after "Lock".
+// The Telegram login session is saved on disk only in encrypted form (under that key).
+const mem = chrome.storage.session || null;
+async function rememberKey(uid, bits) { if (mem) await mem.set({ mk: { uid, k: b64u(bits) } }); }
+async function recallKey(uid) {
+  try { const mk = mem && (await mem.get('mk')).mk; return mk && mk.uid === uid ? await importMaster(unb64u(mk.k)) : null; } catch { return null; }
+}
+let savedSession = null;
+async function persistSession() {
+  if (!tg.master || !tg.client) return;
+  const cur = tg.saveSession(); if (!cur || cur === savedSession) return;
+  await store.set({ session_enc: await sealString(tg.master, cur) });
+  await store.remove('session');                 // drop the unencrypted copy older versions kept
+  if (mem) await mem.remove('pending');
+  savedSession = cur;
+}
+async function wipeLocal() {
+  await store.clear(); if (mem) await mem.clear();
+  try { indexedDB.deleteDatabase('tgvault'); } catch { /* older versions kept the key here */ }
+}
 
 // ---------- screens ----------
 function screen(html) { $root.replaceChildren(h(html)); return $root.firstChild; }
@@ -76,13 +90,19 @@ async function loginFlow(prefill = {}) {
     password: async () => (await ask('<label>Two-step verification password</label><input type="password" name="v" autocomplete="current-password" required>', '[name=v]')).v,
     onError: (e) => { err.textContent = errMsg(e); },
   });
-  await store.set({ api_id: creds.api_id, api_hash: creds.api_hash, session: tg.saveSession() });
+  await store.set({ api_id: creds.api_id, api_hash: creds.api_hash });
+  // Not unlocked yet, so the new login is kept in memory only; it is saved (encrypted) once the passphrase is entered.
+  if (mem) await mem.set({ pending: tg.saveSession() });
 }
 
-/** Ask for the encryption passphrase; derive + persist the key. */
-async function unlockFlow(hasVault) {
-  const check = (await store.get('keycheck_' + tg.userId))['keycheck_' + tg.userId];
-  const first = !check && !hasVault;   // brand-new vault: choose a passphrase; otherwise just enter the existing one
+/**
+ * Ask for the encryption passphrase and return the master key.
+ * @param {string} uid Telegram user id (part of the key derivation)
+ * @param {boolean} first true when creating a brand-new vault
+ * @param {(master: CryptoKey, hadCheck: boolean) => Promise<void>} verify throws if the key is not the right one
+ */
+async function unlockFlow(uid, first, verify) {
+  const check = (await store.get('keycheck_' + uid))['keycheck_' + uid];
   const el = screen(`<div class="center"><form class="panel" id="f">
     <h1>${first ? 'Create your encryption passphrase' : 'Unlock your vault'}</h1>
     <p>${first ? 'Your files are encrypted in this browser with a key derived from this passphrase. Telegram only ever sees ciphertext.' : 'Enter your encryption passphrase.'}</p>
@@ -95,7 +115,8 @@ async function unlockFlow(hasVault) {
   </form></div>`);
   const err = el.querySelector('#err');
   el.querySelector('#lo').onclick = () => doLogout();
-  await new Promise((resolve) => {
+  el.querySelector('[name=p]').focus();
+  return new Promise((resolve) => {
     el.querySelector('#f').onsubmit = async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target); const p = fd.get('p');
@@ -103,19 +124,16 @@ async function unlockFlow(hasVault) {
       if (first && p !== fd.get('p2')) { err.textContent = 'Passphrases do not match.'; return; }
       const btn = el.querySelector('button.primary'); btn.disabled = true; err.textContent = ''; btn.textContent = 'Deriving key…';
       try {
-        const master = await deriveMasterKey(p, tg.userId);
+        const bits = await deriveMasterBits(p, uid);
+        const master = await importMaster(bits);
         const kc = await keyCheck(master);
         if (check && check !== kc) throw new Error('That is not the passphrase you set on this device.');
-        await tg.setMaster(master);
-        if (!check) {
-          // New device / first time: make sure it actually opens existing vault files.
-          btn.textContent = 'Checking vault…';
-          if (!(await tg.verifyAgainstVault())) throw new Error('Wrong passphrase: it cannot decrypt files already in your vault.');
-          await store.set({ ['keycheck_' + tg.userId]: kc });
-        }
-        await idb.set('master', { uid: tg.userId, key: master });
-        resolve();
-      } catch (ex) { tg.master = null; err.textContent = errMsg(ex); btn.disabled = false; btn.textContent = first ? 'Create & continue' : 'Unlock'; }
+        btn.textContent = 'Checking…';
+        await verify(master, !!check);
+        if (!check) await store.set({ ['keycheck_' + uid]: kc });
+        await rememberKey(uid, bits);
+        resolve(master);
+      } catch (ex) { err.textContent = errMsg(ex); btn.disabled = false; btn.textContent = first ? 'Create & continue' : 'Unlock'; }
     };
   });
 }
@@ -202,7 +220,7 @@ function pickFolder(title, exclude) {
     const m = h(`<div class="modal"><div class="panel"><h1 style="font-size:18px">${esc(title)}</h1>
       <select id="sel" style="width:100%;padding:10px;margin:12px 0;border-radius:8px;border:1px solid var(--line);background:var(--bg)">${opts.map((o) => `<option value="${esc(o)}">${o ? '📁 ' + esc(o) : '🏠 Home (top level)'}</option>`).join('')}</select>
       <div class="row"><button class="btn primary" id="ok">Move here</button><button class="btn" id="no">Cancel</button></div></div></div>`);
-    document.body.append(m); m.querySelector('#sel').value = state.path in opts ? state.path : (opts.includes(state.path) ? state.path : '');
+    document.body.append(m); m.querySelector('#sel').value = opts.includes(state.path) ? state.path : '';
     const done = (v) => { m.remove(); resolve(v); };
     m.querySelector('#ok').onclick = () => done(m.querySelector('#sel').value); m.querySelector('#no').onclick = () => done(null);
   });
@@ -216,15 +234,16 @@ function askFolderName(title, initial = '') {
 async function newFolder() {
   const name = askFolderName('New folder name'); if (!name) return;
   const path = state.path ? state.path + '/' + name : name;
-  if (path.length > 180) return toast('Folder path too long.');
+  if (path.length > 180 || utf8Len(path) > PATH_MAX_BYTES) return toast('Folder path too long — use shorter folder names.');
   if (allFolders().includes(path)) return toast('That folder already exists.');
   try { await tg.createFolder(path); toast('Folder created'); } catch (e) { toast('Failed: ' + errMsg(e)); }
 }
 async function renameFolder(path) {
   const name = askFolderName('Rename folder', baseName(path)); if (!name || name === baseName(path)) return;
   const np = parentOf(path) ? parentOf(path) + '/' + name : name;
-  if (allFolders().includes(np)) return toast('A folder with that name already exists.');
-  try { toast('Renaming…'); await tg.renameFolder(path, np); if (state.path === path || state.path.startsWith(path + '/')) state.path = np + state.path.slice(path.length); tg.onChange(); } catch (e) { toast('Failed: ' + errMsg(e)); }
+  if (np.length > 180 || utf8Len(np) > PATH_MAX_BYTES) return toast('Folder path too long — use a shorter name.');
+  if (allFolders().includes(np) && !confirm(`A folder named “${name}” already exists here. Merge “${baseName(path)}” into it?`)) return;
+  try { toast('Renaming…'); await tg.renameFolder(path, np); if (state.path === path || state.path.startsWith(path + '/')) state.path = np + state.path.slice(path.length); tg.onChange(); toast('Renamed'); } catch (e) { toast(errMsg(e)); }
 }
 async function deleteFolder(path) {
   const n = countIn(path);
@@ -314,7 +333,7 @@ function showLibrary() {
       <button class="btn primary" id="up">Upload</button>
       <button class="btn" id="nf">New folder</button>
       <button class="btn" id="rf" title="Re-sync with Saved Messages">↻</button>
-      <button class="btn" id="lk" title="Forget the key on this device">Lock</button>
+      <button class="btn" id="lk" title="Forget the key now — the passphrase is needed to open the vault or use the saved Telegram login again">Lock</button>
       <button class="btn danger" id="lo">Log out</button>
       <input type="file" id="pick" multiple hidden>
     </div>
@@ -333,7 +352,7 @@ function showLibrary() {
   $('#nf').onclick = newFolder;
   $('#pick').onchange = (e) => { enqueue([...e.target.files]); e.target.value = ''; };
   $('#rf').onclick = () => syncNow(true);
-  $('#lk').onclick = async () => { await idb.del('master'); tg.master = null; for (const it of tg.items.values()) it.meta = null; location.reload(); };
+  $('#lk').onclick = async () => { if (activeJobs > 0 && !confirm('A transfer is still running and will be cancelled. Lock anyway?')) return; try { await persistSession(); } catch { /* keep the last saved copy */ } if (mem) await mem.remove('mk'); tg.master = null; for (const it of tg.items.values()) it.meta = null; activeJobs = 0; location.reload(); };
   $('#lo').onclick = () => doLogout();
   $('#more').onclick = async () => { $('#more').disabled = true; try { await tg.loadMore(); } finally { $('#more').disabled = false; } };
   tg.onChange = () => { if (state.path && !allFolders().includes(state.path)) state.path = ''; renderGrid(); const m = $('#more'); if (m) m.hidden = !tg.hasMore; };
@@ -375,12 +394,33 @@ function saveBlob(blob, name) {
   const url = URL.createObjectURL(blob); const a = document.createElement('a');
   a.href = url; a.download = name; document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
+const STREAM_MIN = 64 * 1024 * 1024;    // from this size, downloads are written straight to disk instead of held in memory
+const PREVIEW_MAX = 256 * 1024 * 1024;  // larger media is downloaded rather than previewed in the tab
+const safeName = (n) => String(n).replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').replace(/^\.+/, '_').slice(0, 200) || 'file';
 async function downloadItem(it) {
   const t = document.querySelector(`.card[data-id="${it.id}"] [data-a=dl]`); const label = t && t.textContent;
+  const prog = (f) => { if (t) t.textContent = Math.round(f * 100) + '%'; };
+  let out = null, counted = false;
   try {
-    const blob = await tg.downloadDecrypted(it, (f) => { if (t) t.textContent = Math.round(f * 100) + '%'; });
-    saveBlob(blob, nameOf(it));
-  } catch (e) { toast('Download failed: ' + errMsg(e)); } finally { if (t) t.textContent = label; }
+    if (sizeOf(it) >= STREAM_MIN && window.showSaveFilePicker) {
+      // Large file: ask where to save first, then decrypt piece by piece straight into that file.
+      let handle = null;
+      try { handle = await window.showSaveFilePicker({ suggestedName: safeName(nameOf(it)) }); }
+      catch (e) { if (e && e.name === 'AbortError') return; /* picker not usable here -> fall back to the in-memory path */ }
+      if (handle) out = await handle.createWritable();
+    }
+    activeJobs++; counted = true;
+    if (out) {
+      await tg.pipe(it, (p) => out.write(p), prog);
+      const w = out; out = null; await w.close();   // the file only appears under its name once it is complete and verified
+      toast('Saved “' + nameOf(it) + '”');
+    } else {
+      saveBlob(await tg.downloadDecrypted(it, prog), nameOf(it));
+    }
+  } catch (e) {
+    if (out) { try { await out.abort(); } catch { /* nothing was kept */ } }
+    toast('Download failed: ' + errMsg(e));
+  } finally { if (counted) activeJobs--; if (t) t.textContent = label; }
 }
 async function shareItem(it) {
   const size = sizeOf(it), name = nameOf(it), mime = it.enc ? (it.meta && it.meta.t) || '' : it.plainMime || '';
@@ -432,6 +472,7 @@ async function encryptExisting(it) {
 async function openPreview(it) {
   const k = it.enc ? (it.meta && it.meta.t) || '' : it.plainMime || '';
   if (!(k.startsWith('image/') || k.startsWith('video/') || k.startsWith('audio/'))) return downloadItem(it);
+  if (sizeOf(it) > PREVIEW_MAX) { toast('Too large to preview here — downloading instead.'); return downloadItem(it); }
   const m = h(`<div class="modal"><div class="box"><div class="spinner"></div><div>Loading…</div></div></div>`);
   document.body.append(m); let url;
   const close = () => { m.remove(); url && URL.revokeObjectURL(url); document.removeEventListener('keydown', esc_); };
@@ -452,37 +493,70 @@ async function syncNow(manual) {
   try { await tg.refresh(); if (manual) toast('Synced with Saved Messages'); } catch (e) { if (manual) toast('Sync failed: ' + errMsg(e)); }
 }
 async function doLogout() {
-  if (!confirm('Log out of Telegram and remove the session and encryption key from this browser?\n\nYour files stay in Saved Messages; you will need your passphrase to read them again.')) return;
+  const online = !!tg.client;
+  if (!confirm(online
+    ? 'Log out of Telegram and remove the session and encryption key from this browser?\n\nYour files stay in Saved Messages; you will need your passphrase to read them again.'
+    : 'Remove the saved Telegram login and encryption key from this browser?\n\nYour files stay in Saved Messages. Because the vault is locked, this device stays listed under Telegram → Settings → Devices until you end it there.')) return;
   showLoading('Logging out…');
-  try { if (tg.client) await tg.logout(); } catch { /* ignore */ }
-  await store.clear(); await idb.clear();
+  try { if (online) await tg.logout(); } catch { /* ignore */ }
+  await wipeLocal();
   location.reload();
 }
 
 // ---------- boot ----------
 (async function main() {
   try {
+    const cfg = await store.get(['api_id', 'api_hash', 'session', 'session_enc', 'uid']);
+    try { indexedDB.deleteDatabase('tgvault'); } catch { /* older versions kept the key on disk here */ }
+    let master = null, sess = '';
+    if (cfg.session_enc && cfg.uid) {
+      // The saved login is encrypted: the passphrase (or the key still in browser memory) comes before anything else.
+      master = await recallKey(cfg.uid);
+      if (master) { try { sess = await openString(master, cfg.session_enc); } catch { master = null; } }
+      if (!master) {
+        master = await unlockFlow(cfg.uid, false, async (m) => {
+          try { sess = await openString(m, cfg.session_enc); } catch { throw new Error('Wrong passphrase.'); }
+        });
+      }
+    } else {
+      sess = cfg.session || (mem && (await mem.get('pending')).pending) || '';
+    }
     showLoading('Connecting to Telegram…');
-    const cfg = await store.get(['api_id', 'api_hash', 'session']);
-    if (cfg.api_id && cfg.api_hash && cfg.session) {
-      await tg.connect(cfg.api_id, cfg.api_hash, cfg.session);
-      if (!(await tg.isAuthorized())) { try { await tg.client.disconnect(); } catch { /* */ } await store.remove('session'); await loginFlow({ api_id: cfg.api_id, api_hash: cfg.api_hash }); }
+    if (cfg.api_id && cfg.api_hash && sess) {
+      await tg.connect(cfg.api_id, cfg.api_hash, sess);
+      if (!(await tg.isAuthorized())) {
+        try { await tg.client.disconnect(); } catch { /* */ }
+        await store.remove(['session', 'session_enc']); if (mem) await mem.remove('pending');
+        await loginFlow({ api_id: cfg.api_id, api_hash: cfg.api_hash });
+      }
     } else {
       await loginFlow({ api_id: cfg.api_id, api_hash: cfg.api_hash });
     }
     await tg.init();
-    await store.set({ session: tg.saveSession(), uid: tg.userId });
+    if (master && cfg.uid !== tg.userId) master = null;   // signed in as a different account: that key does not apply
+    await store.set({ uid: tg.userId });
 
     showLoading('Loading your vault…');
-    const saved = await idb.get('master');
-    if (saved && saved.uid === tg.userId) { await tg.setMaster(saved.key); }
-    else { await tg.loadMore(); await unlockFlow([...tg.items.values()].some((i) => i.enc)); }
+    if (!master) master = await recallKey(tg.userId);
+    if (master) { await tg.setMaster(master); }
+    else {
+      await tg.loadMore();
+      const hasVault = [...tg.items.values()].some((i) => i.enc);
+      const known = (await store.get('keycheck_' + tg.userId))['keycheck_' + tg.userId];
+      await unlockFlow(tg.userId, !known && !hasVault, async (m, hadCheck) => {
+        await tg.setMaster(m);
+        // New device / first time: make sure the passphrase actually opens the files already in the vault.
+        if (!hadCheck && !(await tg.verifyAgainstVault())) { tg.master = null; throw new Error('Wrong passphrase: it cannot decrypt files already in your vault.'); }
+      });
+      showLoading('Loading your vault…');
+    }
+    await persistSession();
 
     tg.startLive();
     showLibrary();
     await tg.loadMore();
     addEventListener('focus', () => syncNow(false));
-    setInterval(() => store.set({ session: tg.saveSession() }), 60000);
+    setInterval(() => persistSession().catch(() => {}), 60000);
   } catch (e) {
     screen(`<div class="center"><div class="panel"><h1>Something went wrong</h1><p>${esc(errMsg(e))}</p>
       <div class="row"><button class="btn primary" id="r">Retry</button><button class="btn danger" id="lo">Log out</button></div></div></div>`);

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { deriveMasterKey, encryptFile, Decryptor, decryptThumb, encryptMeta, decryptMeta, keyCheck, CHUNK, THUMB_FETCH, decryptWhole } from './src/crypto.js';
+import { deriveMasterBits, importMaster, sealString, openString, fitMeta, metaFits, utf8Len, META_JSON_MAX, deriveMasterKey, encryptFile, Decryptor, decryptThumb, encryptMeta, decryptMeta, keyCheck, CHUNK, THUMB_FETCH, decryptWhole } from './src/crypto.js';
 const master = await deriveMasterKey('correct horse', '12345');
 const wrong = await deriveMasterKey('wrong horse', '12345');
 const blobToU8 = async (b) => new Uint8Array(await b.arrayBuffer());
@@ -43,4 +43,24 @@ await assert.rejects(decryptMeta(wrong, cap));
 assert.equal(await keyCheck(master), await keyCheck(await deriveMasterKey('correct horse', '12345')));
 assert.notEqual(await keyCheck(master), await keyCheck(wrong));
 console.log('meta ok, caption length', cap.length);
+// key bits -> same key as the one-step derivation (the bits are what is remembered in browser memory)
+assert.equal(await keyCheck(await importMaster(await deriveMasterBits('correct horse', '12345'))), await keyCheck(master));
+// saved Telegram session: round-trip, wrong key, tamper
+const sealed = await sealString(master, '1BQANOTAREALSESSION-ü');
+assert.ok(!sealed.includes('NOTAREAL'));
+assert.equal(await openString(master, sealed), '1BQANOTAREALSESSION-ü');
+await assert.rejects(openString(wrong, sealed));
+await assert.rejects(openString(master, sealed.slice(0, -3) + (sealed.endsWith('AAA') ? 'BBB' : 'AAA')));
+console.log('session seal ok');
+// caption limit: long non-Latin names and deep folders must still fit Telegram's 1024-character caption
+const telugu = 'తెలుగు'.repeat(40);
+const big = fitMeta({ n: telugu + '.pdf', t: 'application/pdf', s: 5e9, m: Date.now(), th: 1, p: 'ఫోల్డర్/'.repeat(15) + 'x' });
+assert.ok(metaFits(big) && big.n.endsWith('….pdf') && big.n.length < telugu.length, 'name shortened, extension kept');
+assert.ok((await encryptMeta(master, big)).length <= 1024, 'caption within limit');
+assert.ok((await encryptMeta(master, { n: 'x'.repeat(META_JSON_MAX - 8) })).length <= 1024, 'largest allowed meta fits');
+const small = { n: 'holiday.jpg', t: 'image/jpeg', s: 1, m: 1, th: 1 };
+assert.deepEqual(fitMeta(small), small);
+assert.throws(() => fitMeta({ n: 'a.txt', t: 'text/plain', s: 1, m: 1, th: 0, p: 'p'.repeat(800) }));
+assert.equal(utf8Len('తె'), 6);
+console.log('caption limit ok');
 console.log('ALL PASS');

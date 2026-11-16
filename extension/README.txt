@@ -14,4 +14,6 @@ ONE-TIME CONFIG (done once by whoever builds/distributes it)
 NOTES
  - Keep the TGVault tab open while uploads/downloads run.
  - The passphrase cannot be recovered. Use the same one on every device.
+ - You are asked for the passphrase after every browser restart and after "Lock". The saved Telegram login is encrypted with it.
+ - Files of 64 MB or more ask where to save, then download straight to that file.
  - Log out wipes the Telegram session and the key from this browser.

@@ -70041,10 +70041,12 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
   function chunkAad(i, final) {
     return concat(u32(i), new Uint8Array([final ? 1 : 0]));
   }
-  async function deriveMasterKey(passphrase, userId) {
+  async function deriveMasterBits(passphrase, userId) {
     const salt = new Uint8Array(await subtle.digest("SHA-256", enc.encode("TGVault/v1/salt/" + userId)));
     const base = await subtle.importKey("raw", enc.encode(passphrase.normalize("NFKC")), "PBKDF2", false, ["deriveBits"]);
-    const bits = await subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: PBKDF2_ITER }, base, 256);
+    return new Uint8Array(await subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: PBKDF2_ITER }, base, 256));
+  }
+  function importMaster(bits) {
     return subtle.importKey("raw", bits, "HKDF", false, ["deriveKey", "deriveBits"]);
   }
   async function subKey(master, salt, info, usages) {
@@ -70063,6 +70065,36 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
       64
     );
     return b64u(new Uint8Array(bits));
+  }
+  async function sealString(master, text) {
+    const salt = rand(32), iv = rand(12);
+    const key = await subKey(master, salt, "tgvault/secret/v1", ["encrypt"]);
+    const ct = new Uint8Array(await subtle.encrypt({ name: "AES-GCM", iv, additionalData: enc.encode("secret") }, key, enc.encode(text)));
+    return b64u(concat(salt, iv, ct));
+  }
+  async function openString(master, sealed) {
+    const raw = unb64u(sealed);
+    const key = await subKey(master, raw.subarray(0, 32), "tgvault/secret/v1", ["decrypt"]);
+    const pt = await subtle.decrypt({ name: "AES-GCM", iv: raw.subarray(32, 44), additionalData: enc.encode("secret") }, key, raw.subarray(44));
+    return dec.decode(pt);
+  }
+  var META_JSON_MAX = 700;
+  var PATH_MAX_BYTES = 400;
+  var utf8Len = (s) => enc.encode(String(s)).length;
+  var metaFits = (meta) => utf8Len(JSON.stringify(meta)) <= META_JSON_MAX;
+  function fitMeta(meta) {
+    const m = { ...meta };
+    if (m.t && m.t.length > 100) m.t = "application/octet-stream";
+    if (metaFits(m)) return m;
+    const name = String(m.n || "file"), dot = name.lastIndexOf(".");
+    const ext = dot > 0 && name.length - dot <= 12 ? name.slice(dot) : "";
+    const base = Array.from(ext ? name.slice(0, dot) : name);
+    while (base.length > 8) {
+      base.length -= Math.max(1, Math.ceil((utf8Len(JSON.stringify(m)) - META_JSON_MAX) / 4));
+      m.n = base.join("").trimEnd() + "\u2026" + ext;
+      if (metaFits(m)) return m;
+    }
+    throw new Error("The folder path is too long to store this file \u2014 use shorter folder names.");
   }
   function isVaultCaption(s) {
     return typeof s === "string" && s.startsWith(MAGIC + ":");
@@ -70106,7 +70138,7 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
         key,
         pt
       );
-      parts.push(new Uint8Array(ct));
+      parts.push(new Blob([ct]));
       onProgress && onProgress((i + 1) / n);
     }
     return { blob: new Blob(parts, { type: "application/octet-stream" }), salt };
@@ -70398,8 +70430,8 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
      */
     async uploadFile(file, thumb, extra, onProgress) {
       if (file.size > this.maxSize) throw new Error(`File too large for Telegram (${this.premium ? "4" : "2"} GB limit)`);
+      const meta = fitMeta({ n: (file.name || "file").slice(0, 200), t: file.type || "application/octet-stream", s: file.size, m: file.lastModified || Date.now(), th: thumb ? 1 : 0, ...extra });
       const { blob, salt } = await encryptFile(this.master, file, thumb, (f) => onProgress && onProgress("encrypt", f));
-      const meta = { n: (file.name || "file").slice(0, 200), t: file.type || "application/octet-stream", s: file.size, m: file.lastModified || Date.now(), th: thumb ? 1 : 0, ...extra };
       const caption = await encryptMeta(this.master, meta, salt);
       const rnd = Array.from(crypto.getRandomValues(new Uint8Array(6))).map((b) => b.toString(16).padStart(2, "0")).join("");
       const fname = `tgv-${rnd}.bin`;
@@ -70438,34 +70470,39 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
       it = await this._fresh(it);
       for await (const chunk of this.client.iterDownload({ file: it.msg.media, requestSize, fileSize: (0, import_big_integer.default)(it.size) })) yield chunk;
     }
-    /** Decrypt-while-downloading; returns a Blob of plaintext. */
-    async downloadDecrypted(it, onProgress) {
-      if (!it.enc) return this.downloadPlain(it, onProgress);
-      if (!it.meta) throw new Error("Cannot decrypt: wrong passphrase or damaged metadata");
-      const dec2 = new Decryptor(this.master, it.size);
-      const parts = [];
+    /**
+     * Download (and decrypt, if it is a vault file) piece by piece, handing each plaintext piece to write().
+     * Nothing is accumulated here, so the caller can stream straight to disk. Every piece is authenticated before it
+     * is handed over; a truncated file makes this throw at the end, so the caller must discard what it wrote.
+     */
+    async pipe(it, write, onProgress) {
+      if (it.enc && !it.meta) throw new Error("Cannot decrypt: wrong passphrase or damaged metadata");
+      if (!it.enc && it.isPhoto) {
+        await write(new Uint8Array(await this.client.downloadMedia((await this._fresh(it)).msg)));
+        return;
+      }
+      const dec2 = it.enc ? new Decryptor(this.master, it.size) : null;
       let got = 0;
       for await (const chunk of this._stream(it)) {
-        for (const p of await dec2.feed(chunk)) parts.push(p);
+        if (dec2) {
+          for (const p of await dec2.feed(chunk)) await write(p);
+        } else await write(new Uint8Array(chunk));
         got += chunk.length;
         onProgress && onProgress(got / it.size);
       }
-      dec2.finish();
-      return new Blob(parts, { type: it.meta.t || "application/octet-stream" });
+      if (dec2) dec2.finish();
+    }
+    /** In-memory variant for small files, previews and share files; returns a Blob of plaintext. */
+    async downloadDecrypted(it, onProgress) {
+      const parts = [];
+      await this.pipe(it, (p) => {
+        parts.push(new Blob([p]));
+      }, onProgress);
+      const type = it.enc ? it.meta.t || "application/octet-stream" : it.isPhoto ? "image/jpeg" : it.plainMime;
+      return new Blob(parts, { type });
     }
     async downloadPlain(it, onProgress) {
-      const parts = [];
-      let got = 0;
-      if (it.isPhoto) {
-        const buf = await this.client.downloadMedia((await this._fresh(it)).msg);
-        return new Blob([buf], { type: "image/jpeg" });
-      }
-      for await (const chunk of this._stream(it)) {
-        parts.push(new Uint8Array(chunk));
-        got += chunk.length;
-        onProgress && onProgress(got / it.size);
-      }
-      return new Blob(parts, { type: it.plainMime });
+      return this.downloadDecrypted(it, onProgress);
     }
     /** Small preview image blob (decrypted JPEG) for the grid, or null */
     async thumbnail(it) {
@@ -70484,8 +70521,17 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
     async _setMeta(it, mutate) {
       const meta = { ...it.meta };
       mutate(meta);
+      if (!metaFits(meta)) throw new Error(`\u201C${meta.n}\u201D has too long a name for that folder path.`);
       const cap = await encryptMeta(this.master, meta, saltFromCaption(it.cap));
-      await this.client.editMessage("me", { message: it.id, text: cap });
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await this.client.editMessage("me", { message: it.id, text: cap });
+          break;
+        } catch (e) {
+          if (attempt >= 2) throw e;
+          await sleep(1e3 * (attempt + 1));
+        }
+      }
       it.cap = cap;
       it.meta = meta;
     }
@@ -70503,10 +70549,39 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
       });
       this.onChange();
     }
+    /**
+     * Telegram has no "rename many" call, so each file is edited in turn. To keep a folder from being left half-renamed:
+     * everything is checked first (nothing is touched if any file would not fit), and if an edit fails part-way the
+     * files already changed are put back.
+     */
     async renameFolder(oldP, newP) {
-      for (const it of [...this.items.values()]) if (this._inFolder(it, oldP)) await this._setMeta(it, (m) => {
-        m.p = newP + m.p.slice(oldP.length);
-      });
+      const plan = [...this.items.values()].filter((it) => this._inFolder(it, oldP)).map((it) => ({ it, from: it.meta.p, to: newP + it.meta.p.slice(oldP.length) }));
+      if (plan.some((s) => utf8Len(s.to) > PATH_MAX_BYTES)) throw new Error("The new folder path would be too long \u2014 use a shorter name.");
+      const tooLong = plan.filter((s) => !metaFits({ ...s.it.meta, p: s.to })).length;
+      if (tooLong) throw new Error(`${tooLong} file(s) have names too long for that folder name \u2014 use a shorter name.`);
+      const done = [];
+      try {
+        for (const s of plan) {
+          await this._setMeta(s.it, (m) => {
+            m.p = s.to;
+          });
+          done.push(s);
+        }
+      } catch (e) {
+        let stuck = 0;
+        for (const s of done.reverse()) {
+          try {
+            await this._setMeta(s.it, (m) => {
+              m.p = s.from;
+            });
+          } catch {
+            stuck++;
+          }
+        }
+        this.onChange();
+        const why = e && (e.errorMessage || e.message) || String(e);
+        throw new Error(stuck ? `Rename stopped part-way (${why}). ${stuck} file(s) are already in the new folder \u2014 rename the old folder again to finish.` : `Rename did not go through and was undone (${why}). Nothing was changed.`);
+      }
       this.onChange();
     }
     async deleteFolder(path) {
@@ -70675,49 +70750,36 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     toastT = setTimeout(() => toastEl.classList.remove("show"), 3500);
   }
   var errMsg = (e) => e && (e.errorMessage || e.message) || String(e);
-  var idb = {
-    open: () => new Promise((res, rej) => {
-      const r = indexedDB.open("tgvault", 1);
-      r.onupgradeneeded = () => r.result.createObjectStore("kv");
-      r.onsuccess = () => res(r.result);
-      r.onerror = () => rej(r.error);
-    }),
-    async get(k) {
-      const db = await this.open();
-      return new Promise((res, rej) => {
-        const q = db.transaction("kv").objectStore("kv").get(k);
-        q.onsuccess = () => res(q.result);
-        q.onerror = () => rej(q.error);
-      });
-    },
-    async set(k, v) {
-      const db = await this.open();
-      return new Promise((res, rej) => {
-        const t = db.transaction("kv", "readwrite");
-        t.objectStore("kv").put(v, k);
-        t.oncomplete = res;
-        t.onerror = () => rej(t.error);
-      });
-    },
-    async del(k) {
-      const db = await this.open();
-      return new Promise((res, rej) => {
-        const t = db.transaction("kv", "readwrite");
-        t.objectStore("kv").delete(k);
-        t.oncomplete = res;
-        t.onerror = () => rej(t.error);
-      });
-    },
-    async clear() {
-      const db = await this.open();
-      return new Promise((res, rej) => {
-        const t = db.transaction("kv", "readwrite");
-        t.objectStore("kv").clear();
-        t.oncomplete = res;
-        t.onerror = () => rej(t.error);
-      });
+  var mem = chrome.storage.session || null;
+  async function rememberKey(uid, bits) {
+    if (mem) await mem.set({ mk: { uid, k: b64u(bits) } });
+  }
+  async function recallKey(uid) {
+    try {
+      const mk = mem && (await mem.get("mk")).mk;
+      return mk && mk.uid === uid ? await importMaster(unb64u(mk.k)) : null;
+    } catch {
+      return null;
     }
-  };
+  }
+  var savedSession = null;
+  async function persistSession() {
+    if (!tg.master || !tg.client) return;
+    const cur = tg.saveSession();
+    if (!cur || cur === savedSession) return;
+    await store.set({ session_enc: await sealString(tg.master, cur) });
+    await store.remove("session");
+    if (mem) await mem.remove("pending");
+    savedSession = cur;
+  }
+  async function wipeLocal() {
+    await store.clear();
+    if (mem) await mem.clear();
+    try {
+      indexedDB.deleteDatabase("tgvault");
+    } catch {
+    }
+  }
   function screen(html) {
     $root.replaceChildren(h(html));
     return $root.firstChild;
@@ -70788,11 +70850,11 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
         err.textContent = errMsg(e);
       }
     });
-    await store.set({ api_id: creds.api_id, api_hash: creds.api_hash, session: tg.saveSession() });
+    await store.set({ api_id: creds.api_id, api_hash: creds.api_hash });
+    if (mem) await mem.set({ pending: tg.saveSession() });
   }
-  async function unlockFlow(hasVault) {
-    const check = (await store.get("keycheck_" + tg.userId))["keycheck_" + tg.userId];
-    const first = !check && !hasVault;
+  async function unlockFlow(uid, first, verify) {
+    const check = (await store.get("keycheck_" + uid))["keycheck_" + uid];
     const el = screen(`<div class="center"><form class="panel" id="f">
     <h1>${first ? "Create your encryption passphrase" : "Unlock your vault"}</h1>
     <p>${first ? "Your files are encrypted in this browser with a key derived from this passphrase. Telegram only ever sees ciphertext." : "Enter your encryption passphrase."}</p>
@@ -70805,7 +70867,8 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
   </form></div>`);
     const err = el.querySelector("#err");
     el.querySelector("#lo").onclick = () => doLogout();
-    await new Promise((resolve) => {
+    el.querySelector("[name=p]").focus();
+    return new Promise((resolve) => {
       el.querySelector("#f").onsubmit = async (e) => {
         e.preventDefault();
         const fd = new FormData(e.target);
@@ -70823,19 +70886,16 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
         err.textContent = "";
         btn.textContent = "Deriving key\u2026";
         try {
-          const master = await deriveMasterKey(p, tg.userId);
+          const bits = await deriveMasterBits(p, uid);
+          const master = await importMaster(bits);
           const kc = await keyCheck(master);
           if (check && check !== kc) throw new Error("That is not the passphrase you set on this device.");
-          await tg.setMaster(master);
-          if (!check) {
-            btn.textContent = "Checking vault\u2026";
-            if (!await tg.verifyAgainstVault()) throw new Error("Wrong passphrase: it cannot decrypt files already in your vault.");
-            await store.set({ ["keycheck_" + tg.userId]: kc });
-          }
-          await idb.set("master", { uid: tg.userId, key: master });
-          resolve();
+          btn.textContent = "Checking\u2026";
+          await verify(master, !!check);
+          if (!check) await store.set({ ["keycheck_" + uid]: kc });
+          await rememberKey(uid, bits);
+          resolve(master);
         } catch (ex) {
-          tg.master = null;
           err.textContent = errMsg(ex);
           btn.disabled = false;
           btn.textContent = first ? "Create & continue" : "Unlock";
@@ -70954,7 +71014,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       <select id="sel" style="width:100%;padding:10px;margin:12px 0;border-radius:8px;border:1px solid var(--line);background:var(--bg)">${opts.map((o) => `<option value="${esc(o)}">${o ? "\u{1F4C1} " + esc(o) : "\u{1F3E0} Home (top level)"}</option>`).join("")}</select>
       <div class="row"><button class="btn primary" id="ok">Move here</button><button class="btn" id="no">Cancel</button></div></div></div>`);
       document.body.append(m);
-      m.querySelector("#sel").value = state.path in opts ? state.path : opts.includes(state.path) ? state.path : "";
+      m.querySelector("#sel").value = opts.includes(state.path) ? state.path : "";
       const done = (v) => {
         m.remove();
         resolve(v);
@@ -70977,7 +71037,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     const name = askFolderName("New folder name");
     if (!name) return;
     const path = state.path ? state.path + "/" + name : name;
-    if (path.length > 180) return toast("Folder path too long.");
+    if (path.length > 180 || utf8Len(path) > PATH_MAX_BYTES) return toast("Folder path too long \u2014 use shorter folder names.");
     if (allFolders().includes(path)) return toast("That folder already exists.");
     try {
       await tg.createFolder(path);
@@ -70990,14 +71050,16 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     const name = askFolderName("Rename folder", baseName(path));
     if (!name || name === baseName(path)) return;
     const np = parentOf(path) ? parentOf(path) + "/" + name : name;
-    if (allFolders().includes(np)) return toast("A folder with that name already exists.");
+    if (np.length > 180 || utf8Len(np) > PATH_MAX_BYTES) return toast("Folder path too long \u2014 use a shorter name.");
+    if (allFolders().includes(np) && !confirm(`A folder named \u201C${name}\u201D already exists here. Merge \u201C${baseName(path)}\u201D into it?`)) return;
     try {
       toast("Renaming\u2026");
       await tg.renameFolder(path, np);
       if (state.path === path || state.path.startsWith(path + "/")) state.path = np + state.path.slice(path.length);
       tg.onChange();
+      toast("Renamed");
     } catch (e) {
-      toast("Failed: " + errMsg(e));
+      toast(errMsg(e));
     }
   }
   async function deleteFolder(path) {
@@ -71145,7 +71207,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       <button class="btn primary" id="up">Upload</button>
       <button class="btn" id="nf">New folder</button>
       <button class="btn" id="rf" title="Re-sync with Saved Messages">\u21BB</button>
-      <button class="btn" id="lk" title="Forget the key on this device">Lock</button>
+      <button class="btn" id="lk" title="Forget the key now \u2014 the passphrase is needed to open the vault or use the saved Telegram login again">Lock</button>
       <button class="btn danger" id="lo">Log out</button>
       <input type="file" id="pick" multiple hidden>
     </div>
@@ -71177,9 +71239,15 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     };
     $("#rf").onclick = () => syncNow(true);
     $("#lk").onclick = async () => {
-      await idb.del("master");
+      if (activeJobs > 0 && !confirm("A transfer is still running and will be cancelled. Lock anyway?")) return;
+      try {
+        await persistSession();
+      } catch {
+      }
+      if (mem) await mem.remove("mk");
       tg.master = null;
       for (const it of tg.items.values()) it.meta = null;
+      activeJobs = 0;
       location.reload();
     };
     $("#lo").onclick = () => doLogout();
@@ -71277,17 +71345,47 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 6e4);
   }
+  var STREAM_MIN = 64 * 1024 * 1024;
+  var PREVIEW_MAX = 256 * 1024 * 1024;
+  var safeName = (n) => String(n).replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_").replace(/^\.+/, "_").slice(0, 200) || "file";
   async function downloadItem(it) {
     const t = document.querySelector(`.card[data-id="${it.id}"] [data-a=dl]`);
     const label = t && t.textContent;
+    const prog = (f) => {
+      if (t) t.textContent = Math.round(f * 100) + "%";
+    };
+    let out = null, counted = false;
     try {
-      const blob = await tg.downloadDecrypted(it, (f) => {
-        if (t) t.textContent = Math.round(f * 100) + "%";
-      });
-      saveBlob(blob, nameOf(it));
+      if (sizeOf(it) >= STREAM_MIN && window.showSaveFilePicker) {
+        let handle = null;
+        try {
+          handle = await window.showSaveFilePicker({ suggestedName: safeName(nameOf(it)) });
+        } catch (e) {
+          if (e && e.name === "AbortError") return;
+        }
+        if (handle) out = await handle.createWritable();
+      }
+      activeJobs++;
+      counted = true;
+      if (out) {
+        await tg.pipe(it, (p) => out.write(p), prog);
+        const w = out;
+        out = null;
+        await w.close();
+        toast("Saved \u201C" + nameOf(it) + "\u201D");
+      } else {
+        saveBlob(await tg.downloadDecrypted(it, prog), nameOf(it));
+      }
     } catch (e) {
+      if (out) {
+        try {
+          await out.abort();
+        } catch {
+        }
+      }
       toast("Download failed: " + errMsg(e));
     } finally {
+      if (counted) activeJobs--;
       if (t) t.textContent = label;
     }
   }
@@ -71364,6 +71462,10 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
   async function openPreview(it) {
     const k = it.enc ? it.meta && it.meta.t || "" : it.plainMime || "";
     if (!(k.startsWith("image/") || k.startsWith("video/") || k.startsWith("audio/"))) return downloadItem(it);
+    if (sizeOf(it) > PREVIEW_MAX) {
+      toast("Too large to preview here \u2014 downloading instead.");
+      return downloadItem(it);
+    }
     const m = h(`<div class="modal"><div class="box"><div class="spinner"></div><div>Loading\u2026</div></div></div>`);
     document.body.append(m);
     let url;
@@ -71404,48 +71506,87 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     }
   }
   async function doLogout() {
-    if (!confirm("Log out of Telegram and remove the session and encryption key from this browser?\n\nYour files stay in Saved Messages; you will need your passphrase to read them again.")) return;
+    const online = !!tg.client;
+    if (!confirm(online ? "Log out of Telegram and remove the session and encryption key from this browser?\n\nYour files stay in Saved Messages; you will need your passphrase to read them again." : "Remove the saved Telegram login and encryption key from this browser?\n\nYour files stay in Saved Messages. Because the vault is locked, this device stays listed under Telegram \u2192 Settings \u2192 Devices until you end it there.")) return;
     showLoading("Logging out\u2026");
     try {
-      if (tg.client) await tg.logout();
+      if (online) await tg.logout();
     } catch {
     }
-    await store.clear();
-    await idb.clear();
+    await wipeLocal();
     location.reload();
   }
   (async function main() {
     try {
+      const cfg = await store.get(["api_id", "api_hash", "session", "session_enc", "uid"]);
+      try {
+        indexedDB.deleteDatabase("tgvault");
+      } catch {
+      }
+      let master = null, sess = "";
+      if (cfg.session_enc && cfg.uid) {
+        master = await recallKey(cfg.uid);
+        if (master) {
+          try {
+            sess = await openString(master, cfg.session_enc);
+          } catch {
+            master = null;
+          }
+        }
+        if (!master) {
+          master = await unlockFlow(cfg.uid, false, async (m) => {
+            try {
+              sess = await openString(m, cfg.session_enc);
+            } catch {
+              throw new Error("Wrong passphrase.");
+            }
+          });
+        }
+      } else {
+        sess = cfg.session || mem && (await mem.get("pending")).pending || "";
+      }
       showLoading("Connecting to Telegram\u2026");
-      const cfg = await store.get(["api_id", "api_hash", "session"]);
-      if (cfg.api_id && cfg.api_hash && cfg.session) {
-        await tg.connect(cfg.api_id, cfg.api_hash, cfg.session);
+      if (cfg.api_id && cfg.api_hash && sess) {
+        await tg.connect(cfg.api_id, cfg.api_hash, sess);
         if (!await tg.isAuthorized()) {
           try {
             await tg.client.disconnect();
           } catch {
           }
-          await store.remove("session");
+          await store.remove(["session", "session_enc"]);
+          if (mem) await mem.remove("pending");
           await loginFlow({ api_id: cfg.api_id, api_hash: cfg.api_hash });
         }
       } else {
         await loginFlow({ api_id: cfg.api_id, api_hash: cfg.api_hash });
       }
       await tg.init();
-      await store.set({ session: tg.saveSession(), uid: tg.userId });
+      if (master && cfg.uid !== tg.userId) master = null;
+      await store.set({ uid: tg.userId });
       showLoading("Loading your vault\u2026");
-      const saved = await idb.get("master");
-      if (saved && saved.uid === tg.userId) {
-        await tg.setMaster(saved.key);
+      if (!master) master = await recallKey(tg.userId);
+      if (master) {
+        await tg.setMaster(master);
       } else {
         await tg.loadMore();
-        await unlockFlow([...tg.items.values()].some((i) => i.enc));
+        const hasVault = [...tg.items.values()].some((i) => i.enc);
+        const known = (await store.get("keycheck_" + tg.userId))["keycheck_" + tg.userId];
+        await unlockFlow(tg.userId, !known && !hasVault, async (m, hadCheck) => {
+          await tg.setMaster(m);
+          if (!hadCheck && !await tg.verifyAgainstVault()) {
+            tg.master = null;
+            throw new Error("Wrong passphrase: it cannot decrypt files already in your vault.");
+          }
+        });
+        showLoading("Loading your vault\u2026");
       }
+      await persistSession();
       tg.startLive();
       showLibrary();
       await tg.loadMore();
       addEventListener("focus", () => syncNow(false));
-      setInterval(() => store.set({ session: tg.saveSession() }), 6e4);
+      setInterval(() => persistSession().catch(() => {
+      }), 6e4);
     } catch (e) {
       screen(`<div class="center"><div class="panel"><h1>Something went wrong</h1><p>${esc(errMsg(e))}</p>
       <div class="row"><button class="btn primary" id="r">Retry</button><button class="btn danger" id="lo">Log out</button></div></div></div>`);
