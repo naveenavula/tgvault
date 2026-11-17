@@ -13,6 +13,8 @@ ONE-TIME CONFIG (done once by whoever builds/distributes it)
 
 NOTES
  - Keep the TGVault tab open while uploads/downloads run.
+ - "Upload folder" (or dragging a folder in) keeps its subfolders. Empty folders are kept only when dragged in.
+ - Tick files (or Ctrl/Cmd-click, Shift-click for a range) to move or delete many at once; drag files or folders onto a folder or the path bar to move them.
  - The passphrase cannot be recovered. Use the same one on every device.
  - You are asked for the passphrase after every browser restart and after "Lock". The saved Telegram login is encrypted with it.
  - Files of 64 MB or more ask where to save, then download straight to that file.

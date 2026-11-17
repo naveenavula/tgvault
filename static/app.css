@@ -22,10 +22,10 @@ input:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .hint{font-size:12px;color:var(--muted);margin-top:10px}
 .warn{background:rgba(214,69,69,.08);border:1px solid rgba(214,69,69,.35);border-radius:8px;padding:10px 12px;font-size:12.5px;margin-top:14px}
 /* library */
-.top{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;padding:10px 18px;flex-wrap:wrap}
+.top{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;padding:10px 18px;flex-wrap:wrap}
 .logo{font-weight:700;font-size:16px;display:flex;gap:8px;align-items:center}
 .logo img{width:22px;height:22px}
-.top .grow{flex:1;min-width:160px}
+.top .grow{flex:1;min-width:140px}
 .tabs{display:flex;gap:4px}
 .tab{padding:6px 12px;border-radius:999px;border:1px solid transparent;background:none;cursor:pointer;color:var(--muted)}
 .tab.on{background:var(--accent);color:var(--accent-fg)}
@@ -64,3 +64,14 @@ body.dragging .drop{border-color:var(--accent);background:rgba(31,143,224,.08);c
 .modal .panel{color:var(--fg);max-width:380px}
 
 .acts{flex-wrap:wrap}
+
+/* selection + moving */
+.pick{position:absolute;top:5px;right:5px;width:26px;height:26px;display:grid;place-items:center;border-radius:6px;background:rgba(0,0,0,.4);opacity:0;transition:opacity .12s;cursor:pointer;margin:0}
+.card:hover .pick,.card.sel .pick,body.selecting .pick{opacity:1}
+.pick input{width:16px;height:16px;margin:0;pointer-events:none;accent-color:var(--accent)} /* the label handles clicks; the box only shows state */
+.card.sel{outline:2px solid var(--accent);outline-offset:-1px}
+.card[draggable=true]{cursor:grab}
+.selbar{flex-basis:100%;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 10px;border-radius:8px;background:rgba(31,143,224,.12);border:1px solid rgba(31,143,224,.35)}
+.selbar[hidden]{display:none}
+.crumb.over{outline:2px dashed var(--accent);background:rgba(31,143,224,.12)}
+.job .name .sub{font-weight:400}

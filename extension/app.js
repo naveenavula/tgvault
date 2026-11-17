@@ -70580,7 +70580,7 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
         }
         this.onChange();
         const why = e && (e.errorMessage || e.message) || String(e);
-        throw new Error(stuck ? `Rename stopped part-way (${why}). ${stuck} file(s) are already in the new folder \u2014 rename the old folder again to finish.` : `Rename did not go through and was undone (${why}). Nothing was changed.`);
+        throw new Error(stuck ? `Stopped part-way (${why}). ${stuck} file(s) are already in the new place \u2014 repeat the rename or move to finish.` : `That did not go through and was undone (${why}). Nothing was changed.`);
       }
       this.onChange();
     }
@@ -70724,7 +70724,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
   var $root = document.getElementById("root");
   var tg = new TG();
   var store = chrome.storage.local;
-  var state = { filter: "all", q: "", path: "" };
+  var state = { filter: "all", q: "", path: "", sel: /* @__PURE__ */ new Set() };
   var h = (html) => {
     const t = document.createElement("template");
     t.innerHTML = html.trim();
@@ -71007,12 +71007,12 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     });
   }
   var countIn = (path) => [...tg.items.values()].filter((it) => !isMarker(it) && (pathOf(it) === path || pathOf(it).startsWith(path + "/"))).length;
-  function pickFolder(title, exclude) {
+  function pickFolder(title, exclude, okLabel = "Move here") {
     return new Promise((resolve) => {
       const opts = ["", ...allFolders().filter((f) => !exclude || !(f === exclude || f.startsWith(exclude + "/")))];
       const m = h(`<div class="modal"><div class="panel"><h1 style="font-size:18px">${esc(title)}</h1>
       <select id="sel" style="width:100%;padding:10px;margin:12px 0;border-radius:8px;border:1px solid var(--line);background:var(--bg)">${opts.map((o) => `<option value="${esc(o)}">${o ? "\u{1F4C1} " + esc(o) : "\u{1F3E0} Home (top level)"}</option>`).join("")}</select>
-      <div class="row"><button class="btn primary" id="ok">Move here</button><button class="btn" id="no">Cancel</button></div></div></div>`);
+      <div class="row"><button class="btn primary" id="ok">${esc(okLabel)}</button><button class="btn" id="no">Cancel</button></div></div></div>`);
       document.body.append(m);
       m.querySelector("#sel").value = opts.includes(state.path) ? state.path : "";
       const done = (v) => {
@@ -71073,17 +71073,158 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       toast("Failed: " + errMsg(e));
     }
   }
+  var DRAG_IDS = "application/x-tgv-ids";
+  var DRAG_DIR = "application/x-tgv-dir";
+  var isInternalDrag = (dt) => !!dt && [...dt.types].some((t) => t.startsWith("application/x-tgv-"));
+  var placeName = (p) => p ? "\u201C" + baseName(p) + "\u201D" : "Home";
+  async function moveIds(ids, dest) {
+    const its = [...new Set(ids.map(Number))].map((id) => tg.items.get(id)).filter(Boolean);
+    const plain = its.filter((it) => !it.enc).length;
+    const todo = its.filter((it) => it.enc && it.meta && pathOf(it) !== dest);
+    if (!todo.length) {
+      toast(plain ? "Not-encrypted files can\u2019t go in folders \u2014 press Encrypt on them first." : "Already in that folder.");
+      return;
+    }
+    if (dest) {
+      const bad = todo.filter((it) => !metaFits({ ...it.meta, p: dest })).length;
+      if (bad) {
+        toast(`${bad} file(s) have names too long for that folder path \u2014 nothing was moved.`);
+        return;
+      }
+    }
+    let done = 0;
+    try {
+      for (const it of todo) {
+        if (todo.length > 1) toast(`Moving ${done + 1} of ${todo.length}\u2026`);
+        await tg.moveItems([it], dest);
+        state.sel.delete(it.id);
+        done++;
+      }
+    } catch (e) {
+      toast(`Moved ${done} of ${todo.length}, then it failed: ${errMsg(e)}`);
+      tg.onChange();
+      return;
+    }
+    tg.onChange();
+    toast(`Moved ${done} file(s) to ${placeName(dest)}` + (plain ? ` \xB7 ${plain} not-encrypted file(s) skipped` : ""));
+  }
   async function moveItem(it) {
     if (!it.enc) return toast("Encrypt this file first, then you can put it in a folder.");
     const dest = await pickFolder(`Move \u201C${nameOf(it)}\u201D to\u2026`);
-    if (dest == null || dest === pathOf(it)) return;
+    if (dest == null) return;
+    await moveIds([it.id], dest);
+  }
+  async function moveSelected() {
+    const ids = [...state.sel];
+    if (!ids.length) return;
+    const dest = await pickFolder(`Move ${ids.length} file(s) to\u2026`);
+    if (dest == null) return;
+    await moveIds(ids, dest);
+  }
+  async function moveFolder(path, dest) {
+    if (dest === path) return;
+    if (dest.startsWith(path + "/")) return toast("A folder can\u2019t be moved into itself.");
+    const np = dest ? dest + "/" + baseName(path) : baseName(path);
+    if (np === path) return;
+    if (np.length > 180 || utf8Len(np) > PATH_MAX_BYTES) return toast("That would make the folder path too long.");
+    if (allFolders().includes(np) && !confirm(`${placeName(dest)} already has a folder named \u201C${baseName(path)}\u201D. Merge them?`)) return;
     try {
-      await tg.moveItems([it], dest);
-      toast("Moved");
+      toast("Moving folder\u2026");
+      await tg.renameFolder(path, np);
+      if (state.path === path || state.path.startsWith(path + "/")) state.path = np + state.path.slice(path.length);
+      tg.onChange();
+      toast(`Moved \u201C${baseName(path)}\u201D to ${placeName(dest)}`);
     } catch (e) {
-      toast("Failed: " + errMsg(e));
+      toast(errMsg(e));
     }
   }
+  async function moveFolderPick(path) {
+    const dest = await pickFolder(`Move folder \u201C${baseName(path)}\u201D to\u2026`, path);
+    if (dest == null) return;
+    await moveFolder(path, dest);
+  }
+  function dropTarget(el, dest) {
+    el.ondragover = (e) => {
+      if (isInternalDrag(e.dataTransfer)) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        el.classList.add("over");
+      }
+    };
+    el.ondragleave = () => el.classList.remove("over");
+    el.ondrop = async (e) => {
+      if (!isInternalDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      el.classList.remove("over");
+      const dir = e.dataTransfer.getData(DRAG_DIR);
+      if (dir) return moveFolder(dir, dest);
+      let ids = [];
+      try {
+        ids = JSON.parse(e.dataTransfer.getData(DRAG_IDS) || "[]");
+      } catch {
+      }
+      if (ids.length) await moveIds(ids, dest);
+    };
+  }
+  var lastPicked = null;
+  function renderSelbar() {
+    const n = state.sel.size;
+    document.body.classList.toggle("selecting", n > 0);
+    const bar = document.getElementById("selbar");
+    if (!bar) return;
+    bar.hidden = !n;
+    if (n) bar.querySelector("[data-n]").textContent = `${n} selected`;
+  }
+  function setSel(id, on) {
+    on ? state.sel.add(id) : state.sel.delete(id);
+    const c = document.querySelector(`.card[data-id="${id}"]`);
+    if (c) {
+      c.classList.toggle("sel", on);
+      const cb = c.querySelector(".pick input");
+      if (cb) cb.checked = on;
+    }
+  }
+  function pick(id, e) {
+    const on = !state.sel.has(id);
+    if (e && e.shiftKey && lastPicked != null) {
+      const ids = visibleItems().map((it) => it.id), a = ids.indexOf(lastPicked), b = ids.indexOf(id);
+      if (a >= 0 && b >= 0) {
+        for (const x of ids.slice(Math.min(a, b), Math.max(a, b) + 1)) setSel(x, true);
+        lastPicked = id;
+        renderSelbar();
+        return;
+      }
+    }
+    setSel(id, on);
+    lastPicked = id;
+    renderSelbar();
+  }
+  function clearSel() {
+    for (const id of [...state.sel]) setSel(id, false);
+    lastPicked = null;
+    renderSelbar();
+  }
+  function selectAllVisible() {
+    for (const it of visibleItems()) setSel(it.id, true);
+    renderSelbar();
+  }
+  async function deleteSelected() {
+    const ids = [...state.sel].filter((id) => tg.items.has(id));
+    if (!ids.length) return;
+    if (!confirm(`Delete ${ids.length} file(s) from Telegram Saved Messages? This cannot be undone.`)) return;
+    try {
+      for (let i = 0; i < ids.length; i += 100) await tg.remove(ids.slice(i, i + 100));
+      state.sel.clear();
+      renderSelbar();
+      toast(`Deleted ${ids.length} file(s)`);
+    } catch (e) {
+      toast("Delete failed: " + errMsg(e));
+    }
+  }
+  addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && state.sel.size && !document.querySelector(".modal")) clearSel();
+  });
   var io = new IntersectionObserver((entries) => {
     for (const e of entries) if (e.isIntersecting) {
       io.unobserve(e.target);
@@ -71102,11 +71243,12 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     }
     const parts = state.path ? state.path.split("/") : [];
     const add = (label, path) => {
-      const b = h(`<button class="crumb">${label}</button>`);
+      const b = h(`<button class="crumb" title="Drop here to move into ${path ? esc(baseName(path)) : "Home"}">${label}</button>`);
       b.onclick = () => {
         state.path = path;
         tg.onChange();
       };
+      dropTarget(b, path);
       c.append(b);
     };
     add("\u{1F3E0} Home", "");
@@ -71117,6 +71259,8 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
   }
   function renderGrid() {
     renderCrumbs();
+    for (const id of [...state.sel]) if (!tg.items.has(id) || isMarker(tg.items.get(id))) state.sel.delete(id);
+    renderSelbar();
     const old = document.getElementById("grid");
     if (!old) return;
     const grid = h('<div id="grid" class="grid"></div>');
@@ -71125,41 +71269,25 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     const items = visibleItems();
     if (!folders.length && !items.length) {
       grid.className = "empty";
-      grid.textContent = tg.items.size ? flatView() ? "No matches." : "This folder is empty \u2014 drop files here, paste an image, or press Upload." : "Nothing here yet \u2014 drop files anywhere, paste an image, or press Upload.";
+      grid.textContent = tg.items.size ? flatView() ? "No matches." : "This folder is empty \u2014 drop files or folders here, paste an image, or press Upload." : "Nothing here yet \u2014 drop files or folders anywhere, paste an image, or press Upload.";
       return;
     }
     for (const f of folders) {
-      const card = h(`<div class="card folder" data-path="${esc(f)}"><div class="thumb"><span class="big">\u{1F4C1}</span></div>
+      const card = h(`<div class="card folder" data-path="${esc(f)}" draggable="true"><div class="thumb" title="Open"><span class="big">\u{1F4C1}</span></div>
       <div class="meta"><div class="name" title="${esc(baseName(f))}">${esc(baseName(f))}</div><div class="sub">${countIn(f)} file(s)</div></div>
-      <div class="acts"><button class="btn small" data-a="rn">Rename</button><button class="btn small danger" data-a="rm">Delete</button></div></div>`);
+      <div class="acts"><button class="btn small" data-a="rn">Rename</button><button class="btn small" data-a="mv">Move</button><button class="btn small danger" data-a="rm">Delete</button></div></div>`);
       card.querySelector(".thumb").onclick = () => {
         state.path = f;
         tg.onChange();
       };
       card.querySelector("[data-a=rn]").onclick = () => renameFolder(f);
+      card.querySelector("[data-a=mv]").onclick = () => moveFolderPick(f);
       card.querySelector("[data-a=rm]").onclick = () => deleteFolder(f);
-      card.ondragover = (e) => {
-        if (e.dataTransfer.types.includes("application/x-tgv-id")) {
-          e.preventDefault();
-          card.classList.add("over");
-        }
+      card.ondragstart = (e) => {
+        e.dataTransfer.setData(DRAG_DIR, f);
+        e.dataTransfer.effectAllowed = "move";
       };
-      card.ondragleave = () => card.classList.remove("over");
-      card.ondrop = async (e) => {
-        const id = e.dataTransfer.getData("application/x-tgv-id");
-        if (!id) return;
-        e.preventDefault();
-        e.stopPropagation();
-        card.classList.remove("over");
-        const it = tg.items.get(Number(id));
-        if (!it || !it.enc) return toast("Encrypt this file first.");
-        try {
-          await tg.moveItems([it], f);
-          toast("Moved to " + baseName(f));
-        } catch (er) {
-          toast("Failed: " + errMsg(er));
-        }
-      };
+      dropTarget(card, f);
       grid.append(card);
     }
     for (const it of items) {
@@ -71167,21 +71295,36 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       const hasThumb = it.isPhoto || it.enc && it.meta && it.meta.th;
       const where = flatView() && pathOf(it) ? " \xB7 \u{1F4C1} " + esc(pathOf(it)) : "";
       const card = h(`<div class="card" data-id="${it.id}" ${it.enc ? 'draggable="true"' : ""}>
-      <div class="thumb" title="Open">${hasThumb ? '<img hidden alt="" draggable="false">' : ""}<span class="ext">${esc(ext)}</span>
+      <div class="thumb" title="Open (Ctrl+click to select)">${hasThumb ? '<img hidden alt="" draggable="false">' : ""}<span class="ext">${esc(ext)}</span>
+        <label class="pick" title="Select (Shift+click for a range)"><input type="checkbox"></label>
         <span class="badge ${it.enc ? "" : "plain"}">${it.enc ? "\u{1F512} E2EE" : "not encrypted"}</span></div>
       <div class="meta"><div class="name" title="${esc(name)}">${esc(name)}</div><div class="sub">${fmtSize(sizeOf(it))} \xB7 ${fmtDate(it.date)}${where}</div></div>
       <div class="acts"><button class="btn small" data-a="dl">Download</button><button class="btn small" data-a="sh" title="Make a password-locked file you can send to anyone">Share</button>${it.enc ? '<button class="btn small" data-a="mv">Move</button>' : '<button class="btn small" data-a="enc" title="Encrypt this file and replace the original">Encrypt</button>'}<button class="btn small danger" data-a="rm">Delete</button></div>
     </div>`);
       card.ondragstart = (e) => {
-        e.dataTransfer.setData("application/x-tgv-id", String(it.id));
+        const ids = state.sel.has(it.id) ? [...state.sel] : [it.id];
+        e.dataTransfer.setData(DRAG_IDS, JSON.stringify(ids));
         e.dataTransfer.effectAllowed = "move";
+      };
+      if (state.sel.has(it.id)) {
+        card.classList.add("sel");
+        card.querySelector(".pick input").checked = true;
+      }
+      const pk = card.querySelector(".pick");
+      pk.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        pick(it.id, e);
       };
       const img = card.querySelector("img");
       if (img) img.onload = () => {
         img.hidden = false;
         card.querySelector(".ext").hidden = true;
       };
-      card.querySelector(".thumb").onclick = () => openPreview(it);
+      card.querySelector(".thumb").onclick = (e) => {
+        if (state.sel.size || e.ctrlKey || e.metaKey || e.shiftKey) pick(it.id, e);
+        else openPreview(it);
+      };
       card.querySelector("[data-a=dl]").onclick = () => downloadItem(it);
       card.querySelector("[data-a=sh]").onclick = () => shareItem(it);
       const mv = card.querySelector("[data-a=mv]");
@@ -71205,15 +71348,20 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
         <button class="tab" data-f="file">Files</button><button class="tab" data-f="plain">Not encrypted</button>
       </div>
       <button class="btn primary" id="up">Upload</button>
+      <button class="btn" id="updir" title="Upload a whole folder, keeping its subfolders">Upload folder</button>
       <button class="btn" id="nf">New folder</button>
       <button class="btn" id="rf" title="Re-sync with Saved Messages">\u21BB</button>
       <button class="btn" id="lk" title="Forget the key now \u2014 the passphrase is needed to open the vault or use the saved Telegram login again">Lock</button>
       <button class="btn danger" id="lo">Log out</button>
       <input type="file" id="pick" multiple hidden>
+      <input type="file" id="pickdir" webkitdirectory multiple hidden>
+      <div id="selbar" class="selbar" hidden><b data-n></b>
+        <button class="btn small primary" id="smv">Move to\u2026</button><button class="btn small danger" id="srm">Delete</button>
+        <button class="btn small" id="sall">Select all here</button><button class="btn small" id="sclr">Clear (Esc)</button></div>
     </div>
     <main>
       <div id="crumbs" class="crumbs"></div>
-      <div class="drop">Drag &amp; drop files here \xB7 everything is encrypted in your browser, then stored in your Telegram <b>Saved Messages</b></div>
+      <div class="drop">Drag &amp; drop files or folders here \xB7 drag files onto a folder or the path above to move them \xB7 everything is encrypted in your browser, then stored in your Telegram <b>Saved Messages</b></div>
       <div id="grid" class="grid"></div>
       <div class="row" style="justify-content:center;margin:18px"><button class="btn" id="more" hidden>Load more</button></div>
     </main>
@@ -71237,6 +71385,21 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       enqueue([...e.target.files]);
       e.target.value = "";
     };
+    $("#updir").onclick = () => $("#pickdir").click();
+    $("#pickdir").onchange = (e) => {
+      const fs = [...e.target.files];
+      e.target.value = "";
+      if (!fs.length) return toast("That folder is empty.");
+      const list = fs.map((f) => {
+        const rel = f.webkitRelativePath || f.name;
+        return { file: f, dir: rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "" };
+      });
+      uploadTree(list, [], (fs[0].webkitRelativePath || "").split("/")[0] || "folder");
+    };
+    $("#smv").onclick = moveSelected;
+    $("#srm").onclick = deleteSelected;
+    $("#sall").onclick = selectAllVisible;
+    $("#sclr").onclick = clearSel;
     $("#rf").onclick = () => syncNow(true);
     $("#lk").onclick = async () => {
       if (activeJobs > 0 && !confirm("A transfer is still running and will be cancelled. Lock anyway?")) return;
@@ -71259,8 +71422,14 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
         $("#more").disabled = false;
       }
     };
+    let shownPath = state.path;
     tg.onChange = () => {
       if (state.path && !allFolders().includes(state.path)) state.path = "";
+      if (state.path !== shownPath) {
+        shownPath = state.path;
+        state.sel.clear();
+        lastPicked = null;
+      }
       renderGrid();
       const m = $("#more");
       if (m) m.hidden = !tg.hasMore;
@@ -71286,7 +71455,15 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     e.preventDefault();
     dragDepth = 0;
     document.body.classList.remove("dragging");
-    if (tg.master && e.dataTransfer.files.length && !e.dataTransfer.types.includes("application/x-tgv-id")) enqueue([...e.dataTransfer.files]);
+    if (!tg.master || !document.getElementById("grid") || isInternalDrag(e.dataTransfer)) return;
+    const entries = [...e.dataTransfer.items || []].map((i) => i.kind === "file" && i.webkitGetAsEntry ? i.webkitGetAsEntry() : null).filter(Boolean);
+    if (entries.some((en) => en.isDirectory)) {
+      const label = entries.length === 1 ? entries[0].name : `${entries.length} items`;
+      toast("Reading folder\u2026");
+      collectEntries(entries).then(({ files, dirs }) => uploadTree(files, dirs, label)).catch((er) => toast("Could not read the folder: " + errMsg(er)));
+      return;
+    }
+    if (e.dataTransfer.files.length) enqueue([...e.dataTransfer.files]);
   });
   addEventListener("paste", (e) => {
     if (!tg.master || e.target.tagName === "INPUT") return;
@@ -71301,32 +71478,109 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       e.returnValue = "";
     }
   });
+  var JUNK = /* @__PURE__ */ new Set([".ds_store", "thumbs.db", "desktop.ini"]);
+  function cleanSeg(seg) {
+    const t = Array.from(String(seg).replace(/[\u0000-\u001f\/\\]+/g, " ").trim().replace(/\s+/g, " ")).slice(0, 60).join("").trim();
+    return t || "_";
+  }
+  var joinPath = (base, rel) => [base, ...String(rel).split("/").filter(Boolean).map(cleanSeg)].filter(Boolean).join("/");
+  var pathOk = (p) => p.length <= 180 && utf8Len(p) <= PATH_MAX_BYTES;
+  async function collectEntries(entries) {
+    const files = [], dirs = [];
+    const readAll = (d) => new Promise((res, rej) => {
+      const r = d.createReader(), out = [];
+      const next = () => r.readEntries((batch) => {
+        if (!batch.length) return res(out);
+        out.push(...batch);
+        next();
+      }, rej);
+      next();
+    });
+    const fileOf = (fe) => new Promise((res, rej) => fe.file(res, rej));
+    const walk = async (en, dir) => {
+      if (en.isFile) files.push({ file: await fileOf(en), dir });
+      else if (en.isDirectory) {
+        const d = dir ? dir + "/" + en.name : en.name;
+        dirs.push(d);
+        for (const c of await readAll(en)) await walk(c, d);
+      }
+    };
+    for (const en of entries) await walk(en, "");
+    return { files, dirs };
+  }
+  function uploadTree(files, dirs, label) {
+    const base = state.path, jobs = [];
+    let skipped = 0, bytes = 0;
+    for (const { file, dir } of files) {
+      if (JUNK.has(file.name.toLowerCase())) continue;
+      const p = joinPath(base, dir);
+      if (!pathOk(p)) {
+        skipped++;
+        continue;
+      }
+      jobs.push({ file, path: p });
+      bytes += file.size;
+    }
+    const filled = new Set(jobs.map((j) => j.path));
+    const empty = [...new Set(dirs.map((d) => joinPath(base, d)))].filter((p) => pathOk(p) && ![...filled].some((f) => f === p || f.startsWith(p + "/")) && !allFolders().includes(p));
+    const keptEmpty = empty.filter((p) => !empty.some((q) => q.startsWith(p + "/")));
+    if (!jobs.length && !keptEmpty.length) return toast(skipped ? "Nothing to upload \u2014 the folder paths are too long." : "That folder is empty.");
+    const msg = `Upload ${jobs.length} file(s) (${fmtSize(bytes)}) from \u201C${label}\u201D into ${placeName(base)}?
+
+Subfolders are kept. Everything is encrypted before it leaves this browser. Keep this tab open until it finishes.` + (skipped ? `
+
+${skipped} file(s) are nested too deeply and will be skipped.` : "");
+    if (!confirm(msg)) return;
+    enqueue([...keptEmpty.map((p) => ({ folder: p })), ...jobs]);
+  }
   var activeJobs = 0;
   var pending = [];
   var running = false;
-  function enqueue(files) {
-    for (const f of files) pending.push({ file: f, path: state.path });
+  function enqueue(list) {
+    for (const x of list) pending.push(x instanceof Blob ? { file: x, path: state.path } : x);
     runQueue();
   }
   async function runQueue() {
     if (running) return;
     running = true;
+    let ok = 0, failed = 0;
     while (pending.length) {
-      const { file, path } = pending.shift();
+      const jobSpec = pending.shift();
+      if (jobSpec.folder) {
+        if (!allFolders().includes(jobSpec.folder)) {
+          try {
+            await tg.createFolder(jobSpec.folder);
+          } catch (e) {
+            toast("Could not create folder: " + errMsg(e));
+          }
+        }
+        continue;
+      }
+      const { file, path } = jobSpec;
       const q = document.getElementById("queue");
-      const job = h(`<div class="job"><div class="name">${esc(file.name)}</div><div class="sub" data-s>Preparing\u2026</div><div class="bar"><i></i></div></div>`);
+      const where = path && path !== state.path ? ` <span class="sub">\u2192 \u{1F4C1} ${esc(path)}</span>` : "";
+      const job = h(`<div class="job"><div class="name">${esc(file.name)}${where}</div><div class="sub" data-s>Preparing\u2026</div><div class="bar"><i></i></div><div class="sub" data-left></div></div>`);
       q && q.append(job);
       activeJobs++;
+      const left = job.querySelector("[data-left]");
+      const showLeft = () => {
+        const n = pending.filter((p) => p.file).length;
+        left.textContent = n ? `${n} more waiting` : "";
+      };
+      showLeft();
       const setP = (label, f) => {
         job.querySelector("[data-s]").textContent = label;
         job.querySelector("i").style.width = Math.round(f * 100) + "%";
+        showLeft();
       };
       try {
         const thumb = await makeThumb(file);
         await tg.uploadFile(file, thumb, path ? { p: path } : {}, (stage, f) => setP(stage === "encrypt" ? "Encrypting\u2026" : "Uploading to Telegram\u2026", stage === "encrypt" ? f * 0.3 : 0.3 + f * 0.7));
         setP("Done \u2713", 1);
+        ok++;
         setTimeout(() => job.remove(), 1500);
       } catch (e) {
+        failed++;
         setP("Failed: " + errMsg(e), 0);
         job.querySelector("i").style.background = "var(--danger)";
         setTimeout(() => job.remove(), 9e3);
@@ -71334,6 +71588,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       activeJobs--;
     }
     running = false;
+    if (ok + failed > 1) toast(failed ? `Uploaded ${ok}, ${failed} failed (see the messages bottom-right)` : `Uploaded ${ok} files \u2713`);
   }
   function saveBlob(blob, name) {
     const url = URL.createObjectURL(blob);

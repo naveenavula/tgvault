@@ -278,8 +278,8 @@ export class TG {
       this.onChange();
       const why = (e && (e.errorMessage || e.message)) || String(e);
       throw new Error(stuck
-        ? `Rename stopped part-way (${why}). ${stuck} file(s) are already in the new folder — rename the old folder again to finish.`
-        : `Rename did not go through and was undone (${why}). Nothing was changed.`);
+        ? `Stopped part-way (${why}). ${stuck} file(s) are already in the new place — repeat the rename or move to finish.`
+        : `That did not go through and was undone (${why}). Nothing was changed.`);
     }
     this.onChange();
   }

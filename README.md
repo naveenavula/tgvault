@@ -7,6 +7,8 @@ Chrome / Edge extension that stores photos and files in your own **Telegram Save
 - Large downloads (64 MB+) are written straight to a file you choose instead of being held in memory
 - Files, names, types and folder names are encrypted client-side (PBKDF2-SHA256 → HKDF → AES-256-GCM, chunked, tamper/truncation-proof)
 - Folders, search, preview, drag & drop, live sync with Saved Messages
+- Upload whole folders (button or drag & drop) — subfolders are recreated inside the vault
+- Select many files (checkbox, Ctrl/⌘-click, Shift-click for a range) to move or delete them together; move whole folders with **Move** or by dragging them onto another folder or the path bar
 - Share any file as a single password-locked `.html` file (AES-256-GCM, opens in any browser, ≤150 MB)
 
 ## Install (no Node/npm needed)
