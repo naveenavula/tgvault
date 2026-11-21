@@ -6,6 +6,7 @@ import { generateRandomLong } from 'telegram/Helpers';
 import bigInt from 'big-integer';
 import {
   encryptFile, encryptMeta, decryptMeta, saltFromCaption, decryptThumb, Decryptor, isVaultCaption, THUMB_FETCH,
+  fitMeta, metaFits, utf8Len, PATH_MAX_BYTES, sealString, openString,
 } from './crypto.js';
 
 const PART = 512 * 1024;
@@ -86,6 +87,7 @@ export class TG {
     await Promise.all([this._page('doc'), this._page('photo')]);
     await this._decryptMetas();
     this.onChange();
+    this.saveCache(); // async, non-blocking
   }
   get hasMore() { return !(this.cursors.doc.done && this.cursors.photo.done); }
   async refresh() {
@@ -104,6 +106,7 @@ export class TG {
     }
     await this._decryptMetas();
     this.onChange();
+    this.saveCache(); // async, non-blocking
   }
   async _decryptMetas() {
     if (!this.master) return;
@@ -138,6 +141,55 @@ export class TG {
     }, new Raw({ types: [Api.UpdateDeleteMessages] }));
   }
 
+  // ---------- file-list cache ----------
+  // Cache is stored in chrome.storage.local as sealed JSON, keyed per user.
+  // This lets the vault show files instantly from cache while refreshing in background.
+  _cacheKey() { return 'flist_' + (this.userId || 'anon'); }
+
+  async saveCache() {
+    if (!this.master || !this.userId) return;
+    try {
+      // Serialise only the info needed to render: id, date, enc, cap, size, isPhoto, plainName, plainMime, meta
+      const rows = [];
+      for (const it of this.items.values()) {
+        const row = {
+          id: it.id, date: it.date, enc: it.enc, cap: it.cap,
+          size: it.size, isPhoto: it.isPhoto, plainName: it.plainName, plainMime: it.plainMime,
+        };
+        if (it.meta) row.meta = it.meta;
+        rows.push(row);
+      }
+      const cursors = JSON.parse(JSON.stringify(this.cursors));
+      const payload = JSON.stringify({ rows, cursors, ts: Date.now() });
+      const sealed = await sealString(this.master, payload);
+      await chrome.storage.local.set({ [this._cacheKey()]: sealed });
+    } catch { /* non-fatal */ }
+  }
+
+  async loadCache() {
+    if (!this.master || !this.userId) return false;
+    try {
+      const stored = await chrome.storage.local.get(this._cacheKey());
+      const sealed = stored[this._cacheKey()];
+      if (!sealed) return false;
+      const payload = await openString(this.master, sealed);
+      const { rows, cursors } = JSON.parse(payload);
+      for (const row of rows) {
+        const it = { ...row };
+        // msg object is not cached (too large); create a minimal stub so size/name lookups still work
+        it.msg = null;
+        this.items.set(it.id, it);
+      }
+      // Restore cursor positions so loadMore continues from where we left off
+      if (cursors) this.cursors = cursors;
+      return true;
+    } catch { return false; }
+  }
+
+  async clearCache() {
+    try { await chrome.storage.local.remove(this._cacheKey()); } catch { /* non-fatal */ }
+  }
+
   // ---------- upload ----------
   async _uploadBlob(blob, name, onProgress) {
     const total = Math.ceil(blob.size / PART), big = blob.size > BIG_THRESHOLD;
@@ -169,8 +221,9 @@ export class TG {
    */
   async uploadFile(file, thumb, extra, onProgress) {
     if (file.size > this.maxSize) throw new Error(`File too large for Telegram (${this.premium ? '4' : '2'} GB limit)`);
+    // Fit the metadata into Telegram's caption limit *before* uploading, so a long name can never fail at the very end.
+    const meta = fitMeta({ n: (file.name || 'file').slice(0, 200), t: file.type || 'application/octet-stream', s: file.size, m: file.lastModified || Date.now(), th: thumb ? 1 : 0, ...extra });
     const { blob, salt } = await encryptFile(this.master, file, thumb, (f) => onProgress && onProgress('encrypt', f));
-    const meta = { n: (file.name || 'file').slice(0, 200), t: file.type || 'application/octet-stream', s: file.size, m: file.lastModified || Date.now(), th: thumb ? 1 : 0, ...extra };
     const caption = await encryptMeta(this.master, meta, salt);
     const rnd = Array.from(crypto.getRandomValues(new Uint8Array(6))).map((b) => b.toString(16).padStart(2, '0')).join('');
     const fname = `tgv-${rnd}.bin`;
@@ -200,27 +253,32 @@ export class TG {
     it = await this._fresh(it);
     for await (const chunk of this.client.iterDownload({ file: it.msg.media, requestSize, fileSize: bigInt(it.size) })) yield chunk;
   }
-  /** Decrypt-while-downloading; returns a Blob of plaintext. */
-  async downloadDecrypted(it, onProgress) {
-    if (!it.enc) return this.downloadPlain(it, onProgress);
-    if (!it.meta) throw new Error('Cannot decrypt: wrong passphrase or damaged metadata');
-    const dec = new Decryptor(this.master, it.size); const parts = []; let got = 0;
+  /**
+   * Download (and decrypt, if it is a vault file) piece by piece, handing each plaintext piece to write().
+   * Nothing is accumulated here, so the caller can stream straight to disk. Every piece is authenticated before it
+   * is handed over; a truncated file makes this throw at the end, so the caller must discard what it wrote.
+   */
+  async pipe(it, write, onProgress) {
+    if (it.enc && !it.meta) throw new Error('Cannot decrypt: wrong passphrase or damaged metadata');
+    if (!it.enc && it.isPhoto) {
+      await write(new Uint8Array(await this.client.downloadMedia((await this._fresh(it)).msg)));
+      return;
+    }
+    const dec = it.enc ? new Decryptor(this.master, it.size) : null; let got = 0;
     for await (const chunk of this._stream(it)) {
-      for (const p of await dec.feed(chunk)) parts.push(p);
+      if (dec) { for (const p of await dec.feed(chunk)) await write(p); } else await write(new Uint8Array(chunk));
       got += chunk.length; onProgress && onProgress(got / it.size);
     }
-    dec.finish();
-    return new Blob(parts, { type: it.meta.t || 'application/octet-stream' });
+    if (dec) dec.finish();
   }
-  async downloadPlain(it, onProgress) {
-    const parts = []; let got = 0;
-    if (it.isPhoto) {
-      const buf = await this.client.downloadMedia((await this._fresh(it)).msg);
-      return new Blob([buf], { type: 'image/jpeg' });
-    }
-    for await (const chunk of this._stream(it)) { parts.push(new Uint8Array(chunk)); got += chunk.length; onProgress && onProgress(got / it.size); }
-    return new Blob(parts, { type: it.plainMime });
+  /** In-memory variant for small files, previews and share files; returns a Blob of plaintext. */
+  async downloadDecrypted(it, onProgress) {
+    const parts = [];
+    await this.pipe(it, (p) => { parts.push(new Blob([p])); }, onProgress);
+    const type = it.enc ? it.meta.t || 'application/octet-stream' : it.isPhoto ? 'image/jpeg' : it.plainMime;
+    return new Blob(parts, { type });
   }
+  async downloadPlain(it, onProgress) { return this.downloadDecrypted(it, onProgress); }
   /** Small preview image blob (decrypted JPEG) for the grid, or null */
   async thumbnail(it) {
     if (it.isPhoto) return this.downloadPlain(it);
@@ -237,8 +295,12 @@ export class TG {
   // ---------- folders (stored encrypted as meta.p on each file; empty folders = tiny hidden marker file) ----------
   async _setMeta(it, mutate) {
     const meta = { ...it.meta }; mutate(meta);
+    if (!metaFits(meta)) throw new Error(`“${meta.n}” has too long a name for that folder path.`);
     const cap = await encryptMeta(this.master, meta, saltFromCaption(it.cap));
-    await this.client.editMessage('me', { message: it.id, text: cap });
+    for (let attempt = 0; ; attempt++) {
+      try { await this.client.editMessage('me', { message: it.id, text: cap }); break; }
+      catch (e) { if (attempt >= 2) throw e; await sleep(1000 * (attempt + 1)); }
+    }
     it.cap = cap; it.meta = meta;
   }
   _inFolder(it, path) { const p = it.enc && it.meta && it.meta.p; return !!p && (p === path || p.startsWith(path + '/')); }
@@ -247,8 +309,29 @@ export class TG {
     for (const it of its) if (it.enc && it.meta) await this._setMeta(it, (m) => { if (path) m.p = path; else delete m.p; });
     this.onChange();
   }
+  /**
+   * Telegram has no "rename many" call, so each file is edited in turn. To keep a folder from being left half-renamed:
+   * everything is checked first (nothing is touched if any file would not fit), and if an edit fails part-way the
+   * files already changed are put back.
+   */
   async renameFolder(oldP, newP) {
-    for (const it of [...this.items.values()]) if (this._inFolder(it, oldP)) await this._setMeta(it, (m) => { m.p = newP + m.p.slice(oldP.length); });
+    const plan = [...this.items.values()].filter((it) => this._inFolder(it, oldP))
+      .map((it) => ({ it, from: it.meta.p, to: newP + it.meta.p.slice(oldP.length) }));
+    if (plan.some((s) => utf8Len(s.to) > PATH_MAX_BYTES)) throw new Error('The new folder path would be too long — use a shorter name.');
+    const tooLong = plan.filter((s) => !metaFits({ ...s.it.meta, p: s.to })).length;
+    if (tooLong) throw new Error(`${tooLong} file(s) have names too long for that folder name — use a shorter name.`);
+    const done = [];
+    try {
+      for (const s of plan) { await this._setMeta(s.it, (m) => { m.p = s.to; }); done.push(s); }
+    } catch (e) {
+      let stuck = 0;
+      for (const s of done.reverse()) { try { await this._setMeta(s.it, (m) => { m.p = s.from; }); } catch { stuck++; } }
+      this.onChange();
+      const why = (e && (e.errorMessage || e.message)) || String(e);
+      throw new Error(stuck
+        ? `Stopped part-way (${why}). ${stuck} file(s) are already in the new place — repeat the rename or move to finish.`
+        : `That did not go through and was undone (${why}). Nothing was changed.`);
+    }
     this.onChange();
   }
   async deleteFolder(path) { await this.remove([...this.items.values()].filter((it) => this._inFolder(it, path)).map((it) => it.id)); }

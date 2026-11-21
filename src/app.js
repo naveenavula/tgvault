@@ -1,11 +1,11 @@
 import { TG } from './tg.js';
-import { deriveMasterKey, keyCheck, MAX_THUMB } from './crypto.js';
+import { deriveMasterBits, importMaster, keyCheck, sealString, openString, b64u, unb64u, utf8Len, metaFits, PATH_MAX_BYTES, MAX_THUMB } from './crypto.js';
 import { buildShareHtml, randomPassword, SHARE_MAX } from './share.js';
 
 const $root = document.getElementById('root');
 const tg = new TG();
 const store = chrome.storage.local;
-let state = { filter: 'all', q: '', path: '' };
+let state = { filter: 'all', q: '', path: '', sel: new Set() };
 
 // ---------- tiny helpers ----------
 const h = (html) => { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstChild; };
@@ -16,14 +16,29 @@ const toastEl = document.getElementById('toast'); let toastT;
 function toast(msg) { toastEl.textContent = msg; toastEl.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => toastEl.classList.remove('show'), 3500); }
 const errMsg = (e) => (e && (e.errorMessage || e.message)) || String(e);
 
-// ---------- IndexedDB: holds the non-extractable master key until you lock/log out ----------
-const idb = {
-  open: () => new Promise((res, rej) => { const r = indexedDB.open('tgvault', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }),
-  async get(k) { const db = await this.open(); return new Promise((res, rej) => { const q = db.transaction('kv').objectStore('kv').get(k); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); },
-  async set(k, v) { const db = await this.open(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }); },
-  async del(k) { const db = await this.open(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').delete(k); t.oncomplete = res; t.onerror = () => rej(t.error); }); },
-  async clear() { const db = await this.open(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').clear(); t.oncomplete = res; t.onerror = () => rej(t.error); }); },
-};
+// ---------- secrets ----------
+// The encryption key is remembered only in chrome.storage.session: browser memory that is never written to disk and is
+// wiped when the browser closes. So the passphrase is asked again after every browser restart and after "Lock".
+// The Telegram login session is saved on disk only in encrypted form (under that key).
+const mem = chrome.storage.session || null;
+async function rememberKey(uid, bits) { if (mem) await mem.set({ mk: { uid, k: b64u(bits) } }); }
+async function recallKey(uid) {
+  try { const mk = mem && (await mem.get('mk')).mk; return mk && mk.uid === uid ? await importMaster(unb64u(mk.k)) : null; } catch { return null; }
+}
+let savedSession = null;
+async function persistSession() {
+  if (!tg.master || !tg.client) return;
+  const cur = tg.saveSession(); if (!cur || cur === savedSession) return;
+  await store.set({ session_enc: await sealString(tg.master, cur) });
+  await store.remove('session');                 // drop the unencrypted copy older versions kept
+  if (mem) await mem.remove('pending');
+  savedSession = cur;
+}
+async function wipeLocal() {
+  await tg.clearCache();
+  await store.clear(); if (mem) await mem.clear();
+  try { indexedDB.deleteDatabase('tgvault'); } catch { /* older versions kept the key here */ }
+}
 
 // ---------- screens ----------
 function screen(html) { $root.replaceChildren(h(html)); return $root.firstChild; }
@@ -76,13 +91,19 @@ async function loginFlow(prefill = {}) {
     password: async () => (await ask('<label>Two-step verification password</label><input type="password" name="v" autocomplete="current-password" required>', '[name=v]')).v,
     onError: (e) => { err.textContent = errMsg(e); },
   });
-  await store.set({ api_id: creds.api_id, api_hash: creds.api_hash, session: tg.saveSession() });
+  await store.set({ api_id: creds.api_id, api_hash: creds.api_hash });
+  // Not unlocked yet, so the new login is kept in memory only; it is saved (encrypted) once the passphrase is entered.
+  if (mem) await mem.set({ pending: tg.saveSession() });
 }
 
-/** Ask for the encryption passphrase; derive + persist the key. */
-async function unlockFlow(hasVault) {
-  const check = (await store.get('keycheck_' + tg.userId))['keycheck_' + tg.userId];
-  const first = !check && !hasVault;   // brand-new vault: choose a passphrase; otherwise just enter the existing one
+/**
+ * Ask for the encryption passphrase and return the master key.
+ * @param {string} uid Telegram user id (part of the key derivation)
+ * @param {boolean} first true when creating a brand-new vault
+ * @param {(master: CryptoKey, hadCheck: boolean) => Promise<void>} verify throws if the key is not the right one
+ */
+async function unlockFlow(uid, first, verify) {
+  const check = (await store.get('keycheck_' + uid))['keycheck_' + uid];
   const el = screen(`<div class="center"><form class="panel" id="f">
     <h1>${first ? 'Create your encryption passphrase' : 'Unlock your vault'}</h1>
     <p>${first ? 'Your files are encrypted in this browser with a key derived from this passphrase. Telegram only ever sees ciphertext.' : 'Enter your encryption passphrase.'}</p>
@@ -95,7 +116,8 @@ async function unlockFlow(hasVault) {
   </form></div>`);
   const err = el.querySelector('#err');
   el.querySelector('#lo').onclick = () => doLogout();
-  await new Promise((resolve) => {
+  el.querySelector('[name=p]').focus();
+  return new Promise((resolve) => {
     el.querySelector('#f').onsubmit = async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target); const p = fd.get('p');
@@ -103,19 +125,16 @@ async function unlockFlow(hasVault) {
       if (first && p !== fd.get('p2')) { err.textContent = 'Passphrases do not match.'; return; }
       const btn = el.querySelector('button.primary'); btn.disabled = true; err.textContent = ''; btn.textContent = 'Deriving key…';
       try {
-        const master = await deriveMasterKey(p, tg.userId);
+        const bits = await deriveMasterBits(p, uid);
+        const master = await importMaster(bits);
         const kc = await keyCheck(master);
         if (check && check !== kc) throw new Error('That is not the passphrase you set on this device.');
-        await tg.setMaster(master);
-        if (!check) {
-          // New device / first time: make sure it actually opens existing vault files.
-          btn.textContent = 'Checking vault…';
-          if (!(await tg.verifyAgainstVault())) throw new Error('Wrong passphrase: it cannot decrypt files already in your vault.');
-          await store.set({ ['keycheck_' + tg.userId]: kc });
-        }
-        await idb.set('master', { uid: tg.userId, key: master });
-        resolve();
-      } catch (ex) { tg.master = null; err.textContent = errMsg(ex); btn.disabled = false; btn.textContent = first ? 'Create & continue' : 'Unlock'; }
+        btn.textContent = 'Checking…';
+        await verify(master, !!check);
+        if (!check) await store.set({ ['keycheck_' + uid]: kc });
+        await rememberKey(uid, bits);
+        resolve(master);
+      } catch (ex) { err.textContent = errMsg(ex); btn.disabled = false; btn.textContent = first ? 'Create & continue' : 'Unlock'; }
     };
   });
 }
@@ -148,7 +167,8 @@ function videoFrame(file) {
     setTimeout(() => done(reject, new Error('timeout')), 6000);
   });
 }
-const thumbCache = new Map(); // id -> object URL
+const thumbCache = new Map();   // id -> object URL (thumbnail)
+const previewCache = new Map(); // id -> { url, blob } (full preview, in-memory only)
 let thumbBusy = 0; const thumbQueue = [];
 function requestThumb(it, imgEl) {
   if (thumbCache.has(it.id)) { imgEl.src = thumbCache.get(it.id); return; }
@@ -196,13 +216,13 @@ function visibleItems() {
 }
 const countIn = (path) => [...tg.items.values()].filter((it) => !isMarker(it) && (pathOf(it) === path || pathOf(it).startsWith(path + '/'))).length;
 
-function pickFolder(title, exclude) {
+function pickFolder(title, exclude, okLabel = 'Move here') {
   return new Promise((resolve) => {
     const opts = ['', ...allFolders().filter((f) => !exclude || !(f === exclude || f.startsWith(exclude + '/')))];
     const m = h(`<div class="modal"><div class="panel"><h1 style="font-size:18px">${esc(title)}</h1>
       <select id="sel" style="width:100%;padding:10px;margin:12px 0;border-radius:8px;border:1px solid var(--line);background:var(--bg)">${opts.map((o) => `<option value="${esc(o)}">${o ? '📁 ' + esc(o) : '🏠 Home (top level)'}</option>`).join('')}</select>
-      <div class="row"><button class="btn primary" id="ok">Move here</button><button class="btn" id="no">Cancel</button></div></div></div>`);
-    document.body.append(m); m.querySelector('#sel').value = state.path in opts ? state.path : (opts.includes(state.path) ? state.path : '');
+      <div class="row"><button class="btn primary" id="ok">${esc(okLabel)}</button><button class="btn" id="no">Cancel</button></div></div></div>`);
+    document.body.append(m); m.querySelector('#sel').value = opts.includes(state.path) ? state.path : '';
     const done = (v) => { m.remove(); resolve(v); };
     m.querySelector('#ok').onclick = () => done(m.querySelector('#sel').value); m.querySelector('#no').onclick = () => done(null);
   });
@@ -216,26 +236,120 @@ function askFolderName(title, initial = '') {
 async function newFolder() {
   const name = askFolderName('New folder name'); if (!name) return;
   const path = state.path ? state.path + '/' + name : name;
-  if (path.length > 180) return toast('Folder path too long.');
+  if (path.length > 180 || utf8Len(path) > PATH_MAX_BYTES) return toast('Folder path too long — use shorter folder names.');
   if (allFolders().includes(path)) return toast('That folder already exists.');
   try { await tg.createFolder(path); toast('Folder created'); } catch (e) { toast('Failed: ' + errMsg(e)); }
 }
 async function renameFolder(path) {
   const name = askFolderName('Rename folder', baseName(path)); if (!name || name === baseName(path)) return;
   const np = parentOf(path) ? parentOf(path) + '/' + name : name;
-  if (allFolders().includes(np)) return toast('A folder with that name already exists.');
-  try { toast('Renaming…'); await tg.renameFolder(path, np); if (state.path === path || state.path.startsWith(path + '/')) state.path = np + state.path.slice(path.length); tg.onChange(); } catch (e) { toast('Failed: ' + errMsg(e)); }
+  if (np.length > 180 || utf8Len(np) > PATH_MAX_BYTES) return toast('Folder path too long — use a shorter name.');
+  if (allFolders().includes(np) && !confirm(`A folder named “${name}” already exists here. Merge “${baseName(path)}” into it?`)) return;
+  try { toast('Renaming…'); await tg.renameFolder(path, np); if (state.path === path || state.path.startsWith(path + '/')) state.path = np + state.path.slice(path.length); tg.onChange(); toast('Renamed'); } catch (e) { toast(errMsg(e)); }
 }
 async function deleteFolder(path) {
   const n = countIn(path);
   if (!confirm(`Delete folder “${baseName(path)}” and the ${n} file(s) inside it from Telegram Saved Messages? This cannot be undone.`)) return;
   try { await tg.deleteFolder(path); if (state.path === path || state.path.startsWith(path + '/')) state.path = parentOf(path); tg.onChange(); } catch (e) { toast('Failed: ' + errMsg(e)); }
 }
+// ---------- moving (files, many files, folders) ----------
+const DRAG_IDS = 'application/x-tgv-ids', DRAG_DIR = 'application/x-tgv-dir';
+const isInternalDrag = (dt) => !!dt && [...dt.types].some((t) => t.startsWith('application/x-tgv-'));
+const placeName = (p) => (p ? '“' + baseName(p) + '”' : 'Home');
+
+/** Move files (by id) into folder `dest` ('' = Home). Checks everything first, then moves one by one. */
+async function moveIds(ids, dest) {
+  const its = [...new Set(ids.map(Number))].map((id) => tg.items.get(id)).filter(Boolean);
+  const plain = its.filter((it) => !it.enc).length;
+  const todo = its.filter((it) => it.enc && it.meta && pathOf(it) !== dest);
+  if (!todo.length) { toast(plain ? 'Not-encrypted files can’t go in folders — press Encrypt on them first.' : 'Already in that folder.'); return; }
+  if (dest) {
+    const bad = todo.filter((it) => !metaFits({ ...it.meta, p: dest })).length;
+    if (bad) { toast(`${bad} file(s) have names too long for that folder path — nothing was moved.`); return; }
+  }
+  let done = 0;
+  try {
+    for (const it of todo) {
+      if (todo.length > 1) toast(`Moving ${done + 1} of ${todo.length}…`);
+      await tg.moveItems([it], dest); state.sel.delete(it.id); done++;
+    }
+  } catch (e) { toast(`Moved ${done} of ${todo.length}, then it failed: ${errMsg(e)}`); tg.onChange(); return; }
+  tg.onChange();
+  toast(`Moved ${done} file(s) to ${placeName(dest)}` + (plain ? ` · ${plain} not-encrypted file(s) skipped` : ''));
+}
 async function moveItem(it) {
   if (!it.enc) return toast('Encrypt this file first, then you can put it in a folder.');
-  const dest = await pickFolder(`Move “${nameOf(it)}” to…`); if (dest == null || dest === pathOf(it)) return;
-  try { await tg.moveItems([it], dest); toast('Moved'); } catch (e) { toast('Failed: ' + errMsg(e)); }
+  const dest = await pickFolder(`Move “${nameOf(it)}” to…`); if (dest == null) return;
+  await moveIds([it.id], dest);
 }
+async function moveSelected() {
+  const ids = [...state.sel]; if (!ids.length) return;
+  const dest = await pickFolder(`Move ${ids.length} file(s) to…`); if (dest == null) return;
+  await moveIds(ids, dest);
+}
+/** Move a whole folder (with everything inside) into `dest`. */
+async function moveFolder(path, dest) {
+  if (dest === path) return;
+  if (dest.startsWith(path + '/')) return toast('A folder can’t be moved into itself.');
+  const np = dest ? dest + '/' + baseName(path) : baseName(path);
+  if (np === path) return;
+  if (np.length > 180 || utf8Len(np) > PATH_MAX_BYTES) return toast('That would make the folder path too long.');
+  if (allFolders().includes(np) && !confirm(`${placeName(dest)} already has a folder named “${baseName(path)}”. Merge them?`)) return;
+  try {
+    toast('Moving folder…');
+    await tg.renameFolder(path, np);
+    if (state.path === path || state.path.startsWith(path + '/')) state.path = np + state.path.slice(path.length);
+    tg.onChange(); toast(`Moved “${baseName(path)}” to ${placeName(dest)}`);
+  } catch (e) { toast(errMsg(e)); }
+}
+async function moveFolderPick(path) {
+  const dest = await pickFolder(`Move folder “${baseName(path)}” to…`, path); if (dest == null) return;
+  await moveFolder(path, dest);
+}
+/** Make `el` accept dragged files / folders and move them into `dest`. */
+function dropTarget(el, dest) {
+  el.ondragover = (e) => { if (isInternalDrag(e.dataTransfer)) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; el.classList.add('over'); } };
+  el.ondragleave = () => el.classList.remove('over');
+  el.ondrop = async (e) => {
+    if (!isInternalDrag(e.dataTransfer)) return;
+    e.preventDefault(); e.stopPropagation(); el.classList.remove('over');
+    const dir = e.dataTransfer.getData(DRAG_DIR);
+    if (dir) return moveFolder(dir, dest);
+    let ids = []; try { ids = JSON.parse(e.dataTransfer.getData(DRAG_IDS) || '[]'); } catch { /* */ }
+    if (ids.length) await moveIds(ids, dest);
+  };
+}
+
+// ---------- selection ----------
+let lastPicked = null;
+function renderSelbar() {
+  const n = state.sel.size; document.body.classList.toggle('selecting', n > 0);
+  const bar = document.getElementById('selbar'); if (!bar) return;
+  bar.hidden = !n; if (n) bar.querySelector('[data-n]').textContent = `${n} selected`;
+}
+function setSel(id, on) {
+  on ? state.sel.add(id) : state.sel.delete(id);
+  const c = document.querySelector(`.card[data-id="${id}"]`);
+  if (c) { c.classList.toggle('sel', on); const cb = c.querySelector('.pick input'); if (cb) cb.checked = on; }
+}
+/** Click to toggle; Shift+click selects the whole range from the last picked file. */
+function pick(id, e) {
+  const on = !state.sel.has(id);
+  if (e && e.shiftKey && lastPicked != null) {
+    const ids = visibleItems().map((it) => it.id), a = ids.indexOf(lastPicked), b = ids.indexOf(id);
+    if (a >= 0 && b >= 0) { for (const x of ids.slice(Math.min(a, b), Math.max(a, b) + 1)) setSel(x, true); lastPicked = id; renderSelbar(); return; }
+  }
+  setSel(id, on); lastPicked = id; renderSelbar();
+}
+function clearSel() { for (const id of [...state.sel]) setSel(id, false); lastPicked = null; renderSelbar(); }
+function selectAllVisible() { for (const it of visibleItems()) setSel(it.id, true); renderSelbar(); }
+async function deleteSelected() {
+  const ids = [...state.sel].filter((id) => tg.items.has(id)); if (!ids.length) return;
+  if (!confirm(`Delete ${ids.length} file(s) from Telegram Saved Messages? This cannot be undone.`)) return;
+  try { for (let i = 0; i < ids.length; i += 100) await tg.remove(ids.slice(i, i + 100)); state.sel.clear(); renderSelbar(); toast(`Deleted ${ids.length} file(s)`); }
+  catch (e) { toast('Delete failed: ' + errMsg(e)); }
+}
+addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.sel.size && !document.querySelector('.modal')) clearSel(); });
 
 const io = new IntersectionObserver((entries) => {
   for (const e of entries) if (e.isIntersecting) {
@@ -250,32 +364,30 @@ function renderCrumbs() {
   c.replaceChildren();
   if (flatView()) { c.append(h('<span class="sub">Showing matches from all folders</span>')); return; }
   const parts = state.path ? state.path.split('/') : [];
-  const add = (label, path) => { const b = h(`<button class="crumb">${label}</button>`); b.onclick = () => { state.path = path; tg.onChange(); }; c.append(b); };
+  const add = (label, path) => { const b = h(`<button class="crumb" title="Drop here to move into ${path ? esc(baseName(path)) : 'Home'}">${label}</button>`); b.onclick = () => { state.path = path; tg.onChange(); }; dropTarget(b, path); c.append(b); };
   add('🏠 Home', ''); parts.forEach((_, i) => { c.append(h('<span class="sub">/</span>')); add(esc(parts[i]), parts.slice(0, i + 1).join('/')); });
 }
 function renderGrid() {
   renderCrumbs();
+  for (const id of [...state.sel]) if (!tg.items.has(id) || isMarker(tg.items.get(id))) state.sel.delete(id);
+  renderSelbar();
   const old = document.getElementById('grid'); if (!old) return;
   const grid = h('<div id="grid" class="grid"></div>'); old.replaceWith(grid);
   const folders = flatView() ? [] : allFolders().filter((f) => parentOf(f) === state.path);
   const items = visibleItems();
   if (!folders.length && !items.length) {
-    grid.className = 'empty'; grid.textContent = tg.items.size ? (flatView() ? 'No matches.' : 'This folder is empty — drop files here, paste an image, or press Upload.') : 'Nothing here yet — drop files anywhere, paste an image, or press Upload.'; return;
+    grid.className = 'empty'; grid.textContent = tg.items.size ? (flatView() ? 'No matches.' : 'This folder is empty — drop files or folders here, paste an image, or press Upload.') : 'Nothing here yet — drop files or folders anywhere, paste an image, or press Upload.'; return;
   }
   for (const f of folders) {
-    const card = h(`<div class="card folder" data-path="${esc(f)}"><div class="thumb"><span class="big">📁</span></div>
+    const card = h(`<div class="card folder" data-path="${esc(f)}" draggable="true"><div class="thumb" title="Open"><span class="big">📁</span></div>
       <div class="meta"><div class="name" title="${esc(baseName(f))}">${esc(baseName(f))}</div><div class="sub">${countIn(f)} file(s)</div></div>
-      <div class="acts"><button class="btn small" data-a="rn">Rename</button><button class="btn small danger" data-a="rm">Delete</button></div></div>`);
+      <div class="acts"><button class="btn small" data-a="rn">Rename</button><button class="btn small" data-a="mv">Move</button><button class="btn small danger" data-a="rm">Delete</button></div></div>`);
     card.querySelector('.thumb').onclick = () => { state.path = f; tg.onChange(); };
     card.querySelector('[data-a=rn]').onclick = () => renameFolder(f);
+    card.querySelector('[data-a=mv]').onclick = () => moveFolderPick(f);
     card.querySelector('[data-a=rm]').onclick = () => deleteFolder(f);
-    card.ondragover = (e) => { if (e.dataTransfer.types.includes('application/x-tgv-id')) { e.preventDefault(); card.classList.add('over'); } };
-    card.ondragleave = () => card.classList.remove('over');
-    card.ondrop = async (e) => {
-      const id = e.dataTransfer.getData('application/x-tgv-id'); if (!id) return; e.preventDefault(); e.stopPropagation(); card.classList.remove('over');
-      const it = tg.items.get(Number(id)); if (!it || !it.enc) return toast('Encrypt this file first.');
-      try { await tg.moveItems([it], f); toast('Moved to ' + baseName(f)); } catch (er) { toast('Failed: ' + errMsg(er)); }
-    };
+    card.ondragstart = (e) => { e.dataTransfer.setData(DRAG_DIR, f); e.dataTransfer.effectAllowed = 'move'; };
+    dropTarget(card, f);
     grid.append(card);
   }
   for (const it of items) {
@@ -283,15 +395,23 @@ function renderGrid() {
     const hasThumb = it.isPhoto || (it.enc && it.meta && it.meta.th);
     const where = flatView() && pathOf(it) ? ' · 📁 ' + esc(pathOf(it)) : '';
     const card = h(`<div class="card" data-id="${it.id}" ${it.enc ? 'draggable="true"' : ''}>
-      <div class="thumb" title="Open">${hasThumb ? '<img hidden alt="" draggable="false">' : ''}<span class="ext">${esc(ext)}</span>
+      <div class="thumb" title="Open (Ctrl+click to select)">${hasThumb ? '<img hidden alt="" draggable="false">' : ''}<span class="ext">${esc(ext)}</span>
+        <label class="pick" title="Select (Shift+click for a range)"><input type="checkbox"></label>
         <span class="badge ${it.enc ? '' : 'plain'}">${it.enc ? '🔒 E2EE' : 'not encrypted'}</span></div>
       <div class="meta"><div class="name" title="${esc(name)}">${esc(name)}</div><div class="sub">${fmtSize(sizeOf(it))} · ${fmtDate(it.date)}${where}</div></div>
       <div class="acts"><button class="btn small" data-a="dl">Download</button><button class="btn small" data-a="sh" title="Make a password-locked file you can send to anyone">Share</button>${it.enc ? '<button class="btn small" data-a="mv">Move</button>' : '<button class="btn small" data-a="enc" title="Encrypt this file and replace the original">Encrypt</button>'}<button class="btn small danger" data-a="rm">Delete</button></div>
     </div>`);
-    card.ondragstart = (e) => { e.dataTransfer.setData('application/x-tgv-id', String(it.id)); e.dataTransfer.effectAllowed = 'move'; };
+    card.ondragstart = (e) => {
+      // dragging a selected file carries the whole selection along
+      const ids = state.sel.has(it.id) ? [...state.sel] : [it.id];
+      e.dataTransfer.setData(DRAG_IDS, JSON.stringify(ids)); e.dataTransfer.effectAllowed = 'move';
+    };
+    if (state.sel.has(it.id)) { card.classList.add('sel'); card.querySelector('.pick input').checked = true; }
+    const pk = card.querySelector('.pick');
+    pk.onclick = (e) => { e.preventDefault(); e.stopPropagation(); pick(it.id, e); };
     const img = card.querySelector('img');
     if (img) img.onload = () => { img.hidden = false; card.querySelector('.ext').hidden = true; };
-    card.querySelector('.thumb').onclick = () => openPreview(it);
+    card.querySelector('.thumb').onclick = (e) => { if (state.sel.size || e.ctrlKey || e.metaKey || e.shiftKey) pick(it.id, e); else openPreview(it); };
     card.querySelector('[data-a=dl]').onclick = () => downloadItem(it);
     card.querySelector('[data-a=sh]').onclick = () => shareItem(it);
     const mv = card.querySelector('[data-a=mv]'); if (mv) mv.onclick = () => moveItem(it);
@@ -312,15 +432,20 @@ function showLibrary() {
         <button class="tab" data-f="file">Files</button><button class="tab" data-f="plain">Not encrypted</button>
       </div>
       <button class="btn primary" id="up">Upload</button>
+      <button class="btn" id="updir" title="Upload a whole folder, keeping its subfolders">Upload folder</button>
       <button class="btn" id="nf">New folder</button>
       <button class="btn" id="rf" title="Re-sync with Saved Messages">↻</button>
-      <button class="btn" id="lk" title="Forget the key on this device">Lock</button>
+      <button class="btn" id="lk" title="Forget the key now — the passphrase is needed to open the vault or use the saved Telegram login again">Lock</button>
       <button class="btn danger" id="lo">Log out</button>
       <input type="file" id="pick" multiple hidden>
+      <input type="file" id="pickdir" webkitdirectory multiple hidden>
+      <div id="selbar" class="selbar" hidden><b data-n></b>
+        <button class="btn small primary" id="smv">Move to…</button><button class="btn small danger" id="srm">Delete</button>
+        <button class="btn small" id="sall">Select all here</button><button class="btn small" id="sclr">Clear (Esc)</button></div>
     </div>
     <main>
       <div id="crumbs" class="crumbs"></div>
-      <div class="drop">Drag &amp; drop files here · everything is encrypted in your browser, then stored in your Telegram <b>Saved Messages</b></div>
+      <div class="drop">Drag &amp; drop files or folders here · drag files onto a folder or the path above to move them · everything is encrypted in your browser, then stored in your Telegram <b>Saved Messages</b></div>
       <div id="grid" class="grid"></div>
       <div class="row" style="justify-content:center;margin:18px"><button class="btn" id="more" hidden>Load more</button></div>
     </main>
@@ -332,11 +457,22 @@ function showLibrary() {
   $('#up').onclick = () => $('#pick').click();
   $('#nf').onclick = newFolder;
   $('#pick').onchange = (e) => { enqueue([...e.target.files]); e.target.value = ''; };
+  $('#updir').onclick = () => $('#pickdir').click();
+  $('#pickdir').onchange = (e) => {
+    const fs = [...e.target.files]; e.target.value = ''; if (!fs.length) return toast('That folder is empty.');
+    const list = fs.map((f) => { const rel = f.webkitRelativePath || f.name; return { file: f, dir: rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '' }; });
+    uploadTree(list, [], (fs[0].webkitRelativePath || '').split('/')[0] || 'folder');
+  };
+  $('#smv').onclick = moveSelected; $('#srm').onclick = deleteSelected; $('#sall').onclick = selectAllVisible; $('#sclr').onclick = clearSel;
   $('#rf').onclick = () => syncNow(true);
-  $('#lk').onclick = async () => { await idb.del('master'); tg.master = null; for (const it of tg.items.values()) it.meta = null; location.reload(); };
+  $('#lk').onclick = async () => { if (activeJobs > 0 && !confirm('A transfer is still running and will be cancelled. Lock anyway?')) return; try { await persistSession(); } catch { /* keep the last saved copy */ } if (mem) await mem.remove('mk'); tg.master = null; for (const it of tg.items.values()) it.meta = null; activeJobs = 0; location.reload(); };
   $('#lo').onclick = () => doLogout();
   $('#more').onclick = async () => { $('#more').disabled = true; try { await tg.loadMore(); } finally { $('#more').disabled = false; } };
-  tg.onChange = () => { if (state.path && !allFolders().includes(state.path)) state.path = ''; renderGrid(); const m = $('#more'); if (m) m.hidden = !tg.hasMore; };
+  let shownPath = state.path;
+  tg.onChange = () => {
+    if (state.path && !allFolders().includes(state.path)) state.path = '';
+    if (state.path !== shownPath) { shownPath = state.path; state.sel.clear(); lastPicked = null; }   // new folder, fresh selection
+    renderGrid(); const m = $('#more'); if (m) m.hidden = !tg.hasMore; };
   tg.onChange();
 }
 
@@ -345,29 +481,99 @@ let dragDepth = 0;
 addEventListener('dragenter', (e) => { if (tg.master && e.dataTransfer.types.includes('Files')) { dragDepth++; document.body.classList.add('dragging'); e.preventDefault(); } });
 addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
 addEventListener('dragover', (e) => e.preventDefault());
-addEventListener('drop', (e) => { e.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging'); if (tg.master && e.dataTransfer.files.length && !e.dataTransfer.types.includes('application/x-tgv-id')) enqueue([...e.dataTransfer.files]); });
+addEventListener('drop', (e) => {
+  e.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging');
+  if (!tg.master || !document.getElementById('grid') || isInternalDrag(e.dataTransfer)) return;   // only on the library screen
+  // Folders have to be read through entries, and only during the drop event itself.
+  const entries = [...(e.dataTransfer.items || [])].map((i) => (i.kind === 'file' && i.webkitGetAsEntry ? i.webkitGetAsEntry() : null)).filter(Boolean);
+  if (entries.some((en) => en.isDirectory)) {
+    const label = entries.length === 1 ? entries[0].name : `${entries.length} items`;
+    toast('Reading folder…');
+    collectEntries(entries).then(({ files, dirs }) => uploadTree(files, dirs, label)).catch((er) => toast('Could not read the folder: ' + errMsg(er)));
+    return;
+  }
+  if (e.dataTransfer.files.length) enqueue([...e.dataTransfer.files]);
+});
 addEventListener('paste', (e) => { if (!tg.master || e.target.tagName === 'INPUT') return; const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { enqueue(fs.map((f, i) => (f.name === 'image.png' ? new File([f], `pasted-${Date.now()}-${i}.png`, { type: f.type }) : f))); } });
 addEventListener('beforeunload', (e) => { if (activeJobs > 0) { e.preventDefault(); e.returnValue = ''; } });
 
 // ---------- upload queue ----------
+// ---------- folder upload ----------
+const JUNK = new Set(['.ds_store', 'thumbs.db', 'desktop.ini']);
+/** Folder names coming from disk: no slashes/control characters, max 60 characters (by letter, never cut mid-character). */
+function cleanSeg(seg) {
+  const t = Array.from(String(seg).replace(/[\u0000-\u001f\/\\]+/g, ' ').trim().replace(/\s+/g, ' ')).slice(0, 60).join('').trim();
+  return t || '_';
+}
+const joinPath = (base, rel) => [base, ...String(rel).split('/').filter(Boolean).map(cleanSeg)].filter(Boolean).join('/');
+const pathOk = (p) => p.length <= 180 && utf8Len(p) <= PATH_MAX_BYTES;
+/** Read dropped folders recursively. Returns files with their folder (relative) and every folder seen. */
+async function collectEntries(entries) {
+  const files = [], dirs = [];
+  const readAll = (d) => new Promise((res, rej) => {
+    const r = d.createReader(), out = [];
+    const next = () => r.readEntries((batch) => { if (!batch.length) return res(out); out.push(...batch); next(); }, rej); // returns ~100 at a time
+    next();
+  });
+  const fileOf = (fe) => new Promise((res, rej) => fe.file(res, rej));
+  const walk = async (en, dir) => {
+    if (en.isFile) files.push({ file: await fileOf(en), dir });
+    else if (en.isDirectory) { const d = dir ? dir + '/' + en.name : en.name; dirs.push(d); for (const c of await readAll(en)) await walk(c, d); }
+  };
+  for (const en of entries) await walk(en, '');
+  return { files, dirs };
+}
+/** Queue a folder tree for upload into the current folder, recreating its subfolders. */
+function uploadTree(files, dirs, label) {
+  const base = state.path, jobs = []; let skipped = 0, bytes = 0;
+  for (const { file, dir } of files) {
+    if (JUNK.has(file.name.toLowerCase())) continue;
+    const p = joinPath(base, dir); if (!pathOk(p)) { skipped++; continue; }
+    jobs.push({ file, path: p }); bytes += file.size;
+  }
+  const filled = new Set(jobs.map((j) => j.path));
+  // empty folders only need a marker; folders that hold files appear on their own
+  const empty = [...new Set(dirs.map((d) => joinPath(base, d)))]
+    .filter((p) => pathOk(p) && ![...filled].some((f) => f === p || f.startsWith(p + '/')) && !allFolders().includes(p));
+  const keptEmpty = empty.filter((p) => !empty.some((q) => q.startsWith(p + '/'))); // deepest only; parents follow from them
+  if (!jobs.length && !keptEmpty.length) return toast(skipped ? 'Nothing to upload — the folder paths are too long.' : 'That folder is empty.');
+  const msg = `Upload ${jobs.length} file(s) (${fmtSize(bytes)}) from “${label}” into ${placeName(base)}?`
+    + `\n\nSubfolders are kept. Everything is encrypted before it leaves this browser. Keep this tab open until it finishes.`
+    + (skipped ? `\n\n${skipped} file(s) are nested too deeply and will be skipped.` : '');
+  if (!confirm(msg)) return;
+  enqueue([...keptEmpty.map((p) => ({ folder: p })), ...jobs]);
+}
+
+// ---------- upload queue ----------
 let activeJobs = 0; const pending = []; let running = false;
-function enqueue(files) { for (const f of files) pending.push({ file: f, path: state.path }); runQueue(); }
+/** Accepts Files (go into the current folder) or {file, path} / {folder} jobs. */
+function enqueue(list) { for (const x of list) pending.push(x instanceof Blob ? { file: x, path: state.path } : x); runQueue(); }
 async function runQueue() {
   if (running) return; running = true;
+  let ok = 0, failed = 0;
   while (pending.length) {
-    const { file, path } = pending.shift();
+    const jobSpec = pending.shift();
+    if (jobSpec.folder) {
+      if (!allFolders().includes(jobSpec.folder)) { try { await tg.createFolder(jobSpec.folder); } catch (e) { toast('Could not create folder: ' + errMsg(e)); } }
+      continue;
+    }
+    const { file, path } = jobSpec;
     const q = document.getElementById('queue');
-    const job = h(`<div class="job"><div class="name">${esc(file.name)}</div><div class="sub" data-s>Preparing…</div><div class="bar"><i></i></div></div>`);
+    const where = path && path !== state.path ? ` <span class="sub">→ 📁 ${esc(path)}</span>` : '';
+    const job = h(`<div class="job"><div class="name">${esc(file.name)}${where}</div><div class="sub" data-s>Preparing…</div><div class="bar"><i></i></div><div class="sub" data-left></div></div>`);
     q && q.append(job); activeJobs++;
-    const setP = (label, f) => { job.querySelector('[data-s]').textContent = label; job.querySelector('i').style.width = Math.round(f * 100) + '%'; };
+    const left = job.querySelector('[data-left]'); const showLeft = () => { const n = pending.filter((p) => p.file).length; left.textContent = n ? `${n} more waiting` : ''; };
+    showLeft();
+    const setP = (label, f) => { job.querySelector('[data-s]').textContent = label; job.querySelector('i').style.width = Math.round(f * 100) + '%'; showLeft(); };
     try {
       const thumb = await makeThumb(file);
       await tg.uploadFile(file, thumb, path ? { p: path } : {}, (stage, f) => setP(stage === 'encrypt' ? 'Encrypting…' : 'Uploading to Telegram…', stage === 'encrypt' ? f * 0.3 : 0.3 + f * 0.7));
-      setP('Done ✓', 1); setTimeout(() => job.remove(), 1500);
-    } catch (e) { setP('Failed: ' + errMsg(e), 0); job.querySelector('i').style.background = 'var(--danger)'; setTimeout(() => job.remove(), 9000); }
+      setP('Done ✓', 1); ok++; setTimeout(() => job.remove(), 1500);
+    } catch (e) { failed++; setP('Failed: ' + errMsg(e), 0); job.querySelector('i').style.background = 'var(--danger)'; setTimeout(() => job.remove(), 9000); }
     activeJobs--;
   }
   running = false;
+  if (ok + failed > 1) toast(failed ? `Uploaded ${ok}, ${failed} failed (see the messages bottom-right)` : `Uploaded ${ok} files ✓`);
 }
 
 // ---------- item actions ----------
@@ -375,12 +581,33 @@ function saveBlob(blob, name) {
   const url = URL.createObjectURL(blob); const a = document.createElement('a');
   a.href = url; a.download = name; document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
+const STREAM_MIN = 64 * 1024 * 1024;    // from this size, downloads are written straight to disk instead of held in memory
+const PREVIEW_MAX = 256 * 1024 * 1024;  // larger media is downloaded rather than previewed in the tab
+const safeName = (n) => String(n).replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').replace(/^\.+/, '_').slice(0, 200) || 'file';
 async function downloadItem(it) {
   const t = document.querySelector(`.card[data-id="${it.id}"] [data-a=dl]`); const label = t && t.textContent;
+  const prog = (f) => { if (t) t.textContent = Math.round(f * 100) + '%'; };
+  let out = null, counted = false;
   try {
-    const blob = await tg.downloadDecrypted(it, (f) => { if (t) t.textContent = Math.round(f * 100) + '%'; });
-    saveBlob(blob, nameOf(it));
-  } catch (e) { toast('Download failed: ' + errMsg(e)); } finally { if (t) t.textContent = label; }
+    if (sizeOf(it) >= STREAM_MIN && window.showSaveFilePicker) {
+      // Large file: ask where to save first, then decrypt piece by piece straight into that file.
+      let handle = null;
+      try { handle = await window.showSaveFilePicker({ suggestedName: safeName(nameOf(it)) }); }
+      catch (e) { if (e && e.name === 'AbortError') return; /* picker not usable here -> fall back to the in-memory path */ }
+      if (handle) out = await handle.createWritable();
+    }
+    activeJobs++; counted = true;
+    if (out) {
+      await tg.pipe(it, (p) => out.write(p), prog);
+      const w = out; out = null; await w.close();   // the file only appears under its name once it is complete and verified
+      toast('Saved “' + nameOf(it) + '”');
+    } else {
+      saveBlob(await tg.downloadDecrypted(it, prog), nameOf(it));
+    }
+  } catch (e) {
+    if (out) { try { await out.abort(); } catch { /* nothing was kept */ } }
+    toast('Download failed: ' + errMsg(e));
+  } finally { if (counted) activeJobs--; if (t) t.textContent = label; }
 }
 async function shareItem(it) {
   const size = sizeOf(it), name = nameOf(it), mime = it.enc ? (it.meta && it.meta.t) || '' : it.plainMime || '';
@@ -429,20 +656,114 @@ async function encryptExisting(it) {
     await tg.remove([it.id]); toast('Encrypted ✓ — original removed');
   } catch (e) { toast('Failed: ' + errMsg(e)); }
 }
+function previewableItems() {
+  return visibleItems().filter((it) => {
+    const k = it.enc ? (it.meta && it.meta.t) || '' : it.plainMime || '';
+    return k.startsWith('image/') || k.startsWith('video/') || k.startsWith('audio/');
+  });
+}
+
 async function openPreview(it) {
   const k = it.enc ? (it.meta && it.meta.t) || '' : it.plainMime || '';
   if (!(k.startsWith('image/') || k.startsWith('video/') || k.startsWith('audio/'))) return downloadItem(it);
-  const m = h(`<div class="modal"><div class="box"><div class="spinner"></div><div>Loading…</div></div></div>`);
-  document.body.append(m); let url;
-  const close = () => { m.remove(); url && URL.revokeObjectURL(url); document.removeEventListener('keydown', esc_); };
-  const esc_ = (e) => { if (e.key === 'Escape') close(); }; document.addEventListener('keydown', esc_);
+  if (sizeOf(it) > PREVIEW_MAX) { toast('Too large to preview here — downloading instead.'); return downloadItem(it); }
+
+  // Build the modal shell with arrow buttons
+  const m = h(`<div class="modal pv-modal">
+    <button class="pv-arrow pv-prev" title="Previous (←)">&#8592;</button>
+    <div class="pv-content"><div class="box"><div class="spinner"></div><div>Loading…</div></div></div>
+    <button class="pv-arrow pv-next" title="Next (→)">&#8594;</button>
+  </div>`);
+  document.body.append(m);
+
+  let url = null, currentIt = it, loading = false;
+
+  const updateArrows = () => {
+    const list = previewableItems(), idx = list.findIndex((x) => x.id === currentIt.id);
+    m.querySelector('.pv-prev').disabled = idx <= 0;
+    m.querySelector('.pv-next').disabled = idx < 0 || idx >= list.length - 1;
+  };
+
+  const close = () => {
+    m.remove();
+    // Only revoke if not in the persistent preview cache
+    if (url && !previewCache.has(currentIt.id)) URL.revokeObjectURL(url);
+    document.removeEventListener('keydown', keys_);
+  };
+
+  const loadItem = async (item) => {
+    if (loading) return; loading = true; currentIt = item;
+    // Don't revoke cached URLs — they're shared
+    if (url && !previewCache.has(item.id)) { URL.revokeObjectURL(url); }
+    url = null;
+    const content = m.querySelector('.pv-content');
+    updateArrows();
+
+    // Show cached preview instantly if available
+    const cached = previewCache.get(item.id);
+    if (cached) {
+      url = cached.url;
+      const mime = item.enc ? (item.meta && item.meta.t) || '' : item.plainMime || '';
+      const tag = mime.startsWith('image/') ? `<img src="${url}" alt="">` : mime.startsWith('video/') ? `<video src="${url}" controls autoplay></video>` : `<audio src="${url}" controls autoplay></audio>`;
+      content.replaceChildren(h(tag), h(`<div class="pv-bar"><span class="pv-name">${esc(nameOf(item))}</span><button class="btn small" id="pvdl">Download</button><button class="btn small" id="pvcl">Close</button></div>`));
+      content.querySelector('#pvdl').onclick = () => saveBlob(cached.blob, nameOf(item));
+      content.querySelector('#pvcl').onclick = close;
+      loading = false;
+      // Prefetch neighbours quietly in background
+      const list = previewableItems(), idx = list.findIndex((x) => x.id === item.id);
+      for (const nb of [list[idx - 1], list[idx + 1]]) {
+        if (nb && !previewCache.has(nb.id) && nb.sizeOf <= PREVIEW_MAX) {
+          tg.downloadDecrypted(nb).then((b) => {
+            if (!previewCache.has(nb.id)) previewCache.set(nb.id, { url: URL.createObjectURL(b), blob: b });
+          }).catch(() => {});
+        }
+      }
+      return;
+    }
+
+    content.replaceChildren(h(`<div class="box"><div class="spinner"></div><div>Loading…</div></div>`));
+    try {
+      const mime = item.enc ? (item.meta && item.meta.t) || '' : item.plainMime || '';
+      const blob = await tg.downloadDecrypted(item);
+      url = URL.createObjectURL(blob);
+      previewCache.set(item.id, { url, blob }); // store for instant re-open
+      const tag = mime.startsWith('image/') ? `<img src="${url}" alt="">` : mime.startsWith('video/') ? `<video src="${url}" controls autoplay></video>` : `<audio src="${url}" controls autoplay></audio>`;
+      content.replaceChildren(
+        h(tag),
+        h(`<div class="pv-bar"><span class="pv-name">${esc(nameOf(item))}</span><button class="btn small" id="pvdl">Download</button><button class="btn small" id="pvcl">Close</button></div>`),
+      );
+      content.querySelector('#pvdl').onclick = () => saveBlob(blob, nameOf(item));
+      content.querySelector('#pvcl').onclick = close;
+      // Prefetch neighbours quietly
+      const list = previewableItems(), idx = list.findIndex((x) => x.id === item.id);
+      for (const nb of [list[idx - 1], list[idx + 1]]) {
+        if (nb && !previewCache.has(nb.id) && sizeOf(nb) <= PREVIEW_MAX) {
+          tg.downloadDecrypted(nb).then((b) => {
+            if (!previewCache.has(nb.id)) previewCache.set(nb.id, { url: URL.createObjectURL(b), blob: b });
+          }).catch(() => {});
+        }
+      }
+    } catch (e) { toast('Preview failed: ' + errMsg(e)); close(); }
+    loading = false;
+  };
+
+  const goDir = (dir) => {
+    const list = previewableItems(), idx = list.findIndex((x) => x.id === currentIt.id);
+    const next = list[idx + dir]; if (next) loadItem(next);
+  };
+
+  m.querySelector('.pv-prev').onclick = () => goDir(-1);
+  m.querySelector('.pv-next').onclick = () => goDir(1);
   m.onclick = (e) => { if (e.target === m) close(); };
-  try {
-    const blob = await tg.downloadDecrypted(it); url = URL.createObjectURL(blob);
-    const tag = k.startsWith('image/') ? `<img src="${url}" alt="">` : k.startsWith('video/') ? `<video src="${url}" controls autoplay></video>` : `<audio src="${url}" controls autoplay></audio>`;
-    m.firstChild.replaceChildren(h(tag), h(`<div class="row"><span>${esc(nameOf(it))}</span><button class="btn small">Download</button><button class="btn small">Close</button></div>`));
-    const [dl, cl] = m.querySelectorAll('button'); dl.onclick = () => saveBlob(blob, nameOf(it)); cl.onclick = close;
-  } catch (e) { toast('Preview failed: ' + errMsg(e)); close(); }
+
+  const keys_ = (e) => {
+    if (e.key === 'Escape') close();
+    else if (e.key === 'ArrowLeft') goDir(-1);
+    else if (e.key === 'ArrowRight') goDir(1);
+  };
+  document.addEventListener('keydown', keys_);
+
+  await loadItem(it);
 }
 
 // ---------- sync / logout ----------
@@ -452,37 +773,91 @@ async function syncNow(manual) {
   try { await tg.refresh(); if (manual) toast('Synced with Saved Messages'); } catch (e) { if (manual) toast('Sync failed: ' + errMsg(e)); }
 }
 async function doLogout() {
-  if (!confirm('Log out of Telegram and remove the session and encryption key from this browser?\n\nYour files stay in Saved Messages; you will need your passphrase to read them again.')) return;
+  const online = !!tg.client;
+  if (!confirm(online
+    ? 'Log out of Telegram and remove the session and encryption key from this browser?\n\nYour files stay in Saved Messages; you will need your passphrase to read them again.'
+    : 'Remove the saved Telegram login and encryption key from this browser?\n\nYour files stay in Saved Messages. Because the vault is locked, this device stays listed under Telegram → Settings → Devices until you end it there.')) return;
   showLoading('Logging out…');
-  try { if (tg.client) await tg.logout(); } catch { /* ignore */ }
-  await store.clear(); await idb.clear();
+  try { if (online) await tg.logout(); } catch { /* ignore */ }
+  await wipeLocal();
   location.reload();
 }
 
 // ---------- boot ----------
 (async function main() {
   try {
+    const cfg = await store.get(['api_id', 'api_hash', 'session', 'session_enc', 'uid']);
+    try { indexedDB.deleteDatabase('tgvault'); } catch { /* older versions kept the key on disk here */ }
+    let master = null, sess = '';
+    if (cfg.session_enc && cfg.uid) {
+      // The saved login is encrypted: the passphrase (or the key still in browser memory) comes before anything else.
+      master = await recallKey(cfg.uid);
+      if (master) { try { sess = await openString(master, cfg.session_enc); } catch { master = null; } }
+      if (!master) {
+        master = await unlockFlow(cfg.uid, false, async (m) => {
+          try { sess = await openString(m, cfg.session_enc); } catch { throw new Error('Wrong passphrase.'); }
+        });
+      }
+    } else {
+      sess = cfg.session || (mem && (await mem.get('pending')).pending) || '';
+    }
     showLoading('Connecting to Telegram…');
-    const cfg = await store.get(['api_id', 'api_hash', 'session']);
-    if (cfg.api_id && cfg.api_hash && cfg.session) {
-      await tg.connect(cfg.api_id, cfg.api_hash, cfg.session);
-      if (!(await tg.isAuthorized())) { try { await tg.client.disconnect(); } catch { /* */ } await store.remove('session'); await loginFlow({ api_id: cfg.api_id, api_hash: cfg.api_hash }); }
+    if (cfg.api_id && cfg.api_hash && sess) {
+      await tg.connect(cfg.api_id, cfg.api_hash, sess);
+      if (!(await tg.isAuthorized())) {
+        try { await tg.client.disconnect(); } catch { /* */ }
+        await store.remove(['session', 'session_enc']); if (mem) await mem.remove('pending');
+        await loginFlow({ api_id: cfg.api_id, api_hash: cfg.api_hash });
+      }
     } else {
       await loginFlow({ api_id: cfg.api_id, api_hash: cfg.api_hash });
     }
     await tg.init();
-    await store.set({ session: tg.saveSession(), uid: tg.userId });
+    if (master && cfg.uid !== tg.userId) master = null;   // signed in as a different account: that key does not apply
+    await store.set({ uid: tg.userId });
 
     showLoading('Loading your vault…');
-    const saved = await idb.get('master');
-    if (saved && saved.uid === tg.userId) { await tg.setMaster(saved.key); }
-    else { await tg.loadMore(); await unlockFlow([...tg.items.values()].some((i) => i.enc)); }
+    if (!master) master = await recallKey(tg.userId);
+    if (master) { await tg.setMaster(master); }
+    else {
+      await tg.loadMore();
+      const hasVault = [...tg.items.values()].some((i) => i.enc);
+      const known = (await store.get('keycheck_' + tg.userId))['keycheck_' + tg.userId];
+      await unlockFlow(tg.userId, !known && !hasVault, async (m, hadCheck) => {
+        await tg.setMaster(m);
+        // New device / first time: make sure the passphrase actually opens the files already in the vault.
+        if (!hadCheck && !(await tg.verifyAgainstVault())) { tg.master = null; throw new Error('Wrong passphrase: it cannot decrypt files already in your vault.'); }
+      });
+      showLoading('Loading your vault…');
+    }
+    await persistSession();
 
     tg.startLive();
-    showLibrary();
-    await tg.loadMore();
+
+    // Try the cache first so the library appears instantly.
+    const hadCache = await tg.loadCache();
+    if (hadCache) {
+      showLibrary();
+      // Refresh from Telegram in the background; show a subtle indicator while it runs.
+      const indicator = Object.assign(document.createElement('div'), {
+        id: 'cacheRefresh',
+        textContent: 'Syncing…',
+        style: 'position:fixed;bottom:12px;right:16px;font-size:12px;color:var(--fg2,#888);pointer-events:none;z-index:9999',
+      });
+      document.body.appendChild(indicator);
+      // Load pages one at a time with a short pause so the connection stays free for preview downloads
+      const loadAll = async () => {
+        try {
+          while (tg.hasMore) { await tg.loadMore(); await new Promise((r) => setTimeout(r, 400)); }
+        } catch { /* non-fatal */ } finally { indicator.remove(); }
+      };
+      loadAll();
+    } else {
+      showLibrary();
+      await tg.loadMore();
+    }
     addEventListener('focus', () => syncNow(false));
-    setInterval(() => store.set({ session: tg.saveSession() }), 60000);
+    setInterval(() => persistSession().catch(() => {}), 60000);
   } catch (e) {
     screen(`<div class="center"><div class="panel"><h1>Something went wrong</h1><p>${esc(errMsg(e))}</p>
       <div class="row"><button class="btn primary" id="r">Retry</button><button class="btn danger" id="lo">Log out</button></div></div></div>`);

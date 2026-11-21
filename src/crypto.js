@@ -2,7 +2,10 @@
 //
 // Key hierarchy
 //   passphrase --PBKDF2-SHA256(600k, per-user salt)--> 256-bit secret
-//   secret --import as non-extractable HKDF key--> "master" (stored in IndexedDB, never leaves the browser as raw bytes)
+//   secret --import as non-extractable HKDF key--> "master"
+//   The secret is remembered only in chrome.storage.session (browser memory, never written to disk), so the passphrase
+//   is needed again after the browser restarts or after "Lock".
+//   master --HKDF(random salt, "tgvault/secret/v1")--> AES-256-GCM key that encrypts the saved Telegram login session
 //   master --HKDF(per-file random salt, info)--> AES-256-GCM file key / metadata key
 //
 // File format (what Telegram stores)
@@ -52,11 +55,17 @@ function ivFor(prefix8, counter) { return concat(prefix8, u32(counter)); }
 function chunkAad(i, final) { return concat(u32(i), new Uint8Array([final ? 1 : 0])); }
 
 // ---------- keys ----------
-export async function deriveMasterKey(passphrase, userId) {
+/** The 256-bit secret behind the master key. Keep it in memory only (never on disk). */
+export async function deriveMasterBits(passphrase, userId) {
   const salt = new Uint8Array(await subtle.digest('SHA-256', enc.encode('TGVault/v1/salt/' + userId)));
   const base = await subtle.importKey('raw', enc.encode(passphrase.normalize('NFKC')), 'PBKDF2', false, ['deriveBits']);
-  const bits = await subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: PBKDF2_ITER }, base, 256);
+  return new Uint8Array(await subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: PBKDF2_ITER }, base, 256));
+}
+export function importMaster(bits) {
   return subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey', 'deriveBits']); // non-extractable
+}
+export async function deriveMasterKey(passphrase, userId) {
+  return importMaster(await deriveMasterBits(passphrase, userId));
 }
 async function subKey(master, salt, info, usages) {
   return subtle.deriveKey(
@@ -70,7 +79,47 @@ export async function keyCheck(master) {
   return b64u(new Uint8Array(bits));
 }
 
+// ---------- small secrets (the saved Telegram login session) ----------
+/** Encrypt a short string under the master key. Output: base64url( salt 32 | iv 12 | AES-GCM ciphertext ). */
+export async function sealString(master, text) {
+  const salt = rand(32), iv = rand(12);
+  const key = await subKey(master, salt, 'tgvault/secret/v1', ['encrypt']);
+  const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: enc.encode('secret') }, key, enc.encode(text)));
+  return b64u(concat(salt, iv, ct));
+}
+/** Reverse of sealString. Throws if the key is wrong or the value was modified. */
+export async function openString(master, sealed) {
+  const raw = unb64u(sealed);
+  const key = await subKey(master, raw.subarray(0, 32), 'tgvault/secret/v1', ['decrypt']);
+  const pt = await subtle.decrypt({ name: 'AES-GCM', iv: raw.subarray(32, 44), additionalData: enc.encode('secret') }, key, raw.subarray(44));
+  return dec.decode(pt);
+}
+
 // ---------- metadata ----------
+// The encrypted metadata travels in the Telegram caption, which Telegram caps at 1024 characters.
+// 1024 chars = "TGV1:" + base64url(salt 32 + iv 12 + json + tag 16)  ->  at most 704 bytes of JSON; 700 keeps a small margin.
+export const META_JSON_MAX = 700;
+export const PATH_MAX_BYTES = 400; // folder path budget (UTF-8 bytes), so room is always left for the file name
+export const utf8Len = (s) => enc.encode(String(s)).length;
+export const metaFits = (meta) => utf8Len(JSON.stringify(meta)) <= META_JSON_MAX;
+/**
+ * Make metadata fit the caption limit by shortening the file name (the extension is kept).
+ * Returns a copy. Throws if the folder path alone leaves no room for a name.
+ */
+export function fitMeta(meta) {
+  const m = { ...meta };
+  if (m.t && m.t.length > 100) m.t = 'application/octet-stream';
+  if (metaFits(m)) return m;
+  const name = String(m.n || 'file'), dot = name.lastIndexOf('.');
+  const ext = dot > 0 && name.length - dot <= 12 ? name.slice(dot) : '';
+  const base = Array.from(ext ? name.slice(0, dot) : name); // by code point, so emoji / non-Latin letters are never cut in half
+  while (base.length > 8) {
+    base.length -= Math.max(1, Math.ceil((utf8Len(JSON.stringify(m)) - META_JSON_MAX) / 4));
+    m.n = base.join('').trimEnd() + '…' + ext;
+    if (metaFits(m)) return m;
+  }
+  throw new Error('The folder path is too long to store this file — use shorter folder names.');
+}
 export function isVaultCaption(s) { return typeof s === 'string' && s.startsWith(MAGIC + ':'); }
 
 export async function encryptMeta(master, meta, salt) {
@@ -111,7 +160,7 @@ export async function encryptFile(master, file, thumbBytes, onProgress) {
     const pt = new Uint8Array(await file.slice(i * CHUNK, (i + 1) * CHUNK).arrayBuffer());
     const ct = await subtle.encrypt(
       { name: 'AES-GCM', iv: ivFor(ivPrefix, i), additionalData: chunkAad(i, i === n - 1) }, key, pt);
-    parts.push(new Uint8Array(ct));
+    parts.push(new Blob([ct])); // a Blob per chunk lets the browser keep big files out of page memory
     onProgress && onProgress((i + 1) / n);
   }
   return { blob: new Blob(parts, { type: 'application/octet-stream' }), salt };
