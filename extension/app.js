@@ -70328,6 +70328,7 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
       await Promise.all([this._page("doc"), this._page("photo")]);
       await this._decryptMetas();
       this.onChange();
+      this.saveCache();
     }
     get hasMore() {
       return !(this.cursors.doc.done && this.cursors.photo.done);
@@ -70347,6 +70348,7 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
       }
       await this._decryptMetas();
       this.onChange();
+      this.saveCache();
     }
     async _decryptMetas() {
       if (!this.master) return;
@@ -70396,6 +70398,62 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
           if (ch) this.onChange();
         }
       }, new import_events.Raw({ types: [import_telegram.Api.UpdateDeleteMessages] }));
+    }
+    // ---------- file-list cache ----------
+    // Cache is stored in chrome.storage.local as sealed JSON, keyed per user.
+    // This lets the vault show files instantly from cache while refreshing in background.
+    _cacheKey() {
+      return "flist_" + (this.userId || "anon");
+    }
+    async saveCache() {
+      if (!this.master || !this.userId) return;
+      try {
+        const rows = [];
+        for (const it of this.items.values()) {
+          const row = {
+            id: it.id,
+            date: it.date,
+            enc: it.enc,
+            cap: it.cap,
+            size: it.size,
+            isPhoto: it.isPhoto,
+            plainName: it.plainName,
+            plainMime: it.plainMime
+          };
+          if (it.meta) row.meta = it.meta;
+          rows.push(row);
+        }
+        const cursors = JSON.parse(JSON.stringify(this.cursors));
+        const payload = JSON.stringify({ rows, cursors, ts: Date.now() });
+        const sealed = await sealString(this.master, payload);
+        await chrome.storage.local.set({ [this._cacheKey()]: sealed });
+      } catch {
+      }
+    }
+    async loadCache() {
+      if (!this.master || !this.userId) return false;
+      try {
+        const stored = await chrome.storage.local.get(this._cacheKey());
+        const sealed = stored[this._cacheKey()];
+        if (!sealed) return false;
+        const payload = await openString(this.master, sealed);
+        const { rows, cursors } = JSON.parse(payload);
+        for (const row of rows) {
+          const it = { ...row };
+          it.msg = null;
+          this.items.set(it.id, it);
+        }
+        if (cursors) this.cursors = cursors;
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    async clearCache() {
+      try {
+        await chrome.storage.local.remove(this._cacheKey());
+      } catch {
+      }
     }
     // ---------- upload ----------
     async _uploadBlob(blob, name, onProgress) {
@@ -70773,6 +70831,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     savedSession = cur;
   }
   async function wipeLocal() {
+    await tg.clearCache();
     await store.clear();
     if (mem) await mem.clear();
     try {
@@ -70940,6 +70999,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     });
   }
   var thumbCache = /* @__PURE__ */ new Map();
+  var previewCache = /* @__PURE__ */ new Map();
   var thumbBusy = 0;
   var thumbQueue = [];
   function requestThumb(it, imgEl) {
@@ -71714,6 +71774,12 @@ ${skipped} file(s) are nested too deeply and will be skipped.` : "");
       toast("Failed: " + errMsg(e));
     }
   }
+  function previewableItems() {
+    return visibleItems().filter((it) => {
+      const k = it.enc ? it.meta && it.meta.t || "" : it.plainMime || "";
+      return k.startsWith("image/") || k.startsWith("video/") || k.startsWith("audio/");
+    });
+  }
   async function openPreview(it) {
     const k = it.enc ? it.meta && it.meta.t || "" : it.plainMime || "";
     if (!(k.startsWith("image/") || k.startsWith("video/") || k.startsWith("audio/"))) return downloadItem(it);
@@ -71721,33 +71787,98 @@ ${skipped} file(s) are nested too deeply and will be skipped.` : "");
       toast("Too large to preview here \u2014 downloading instead.");
       return downloadItem(it);
     }
-    const m = h(`<div class="modal"><div class="box"><div class="spinner"></div><div>Loading\u2026</div></div></div>`);
+    const m = h(`<div class="modal pv-modal">
+    <button class="pv-arrow pv-prev" title="Previous (\u2190)">&#8592;</button>
+    <div class="pv-content"><div class="box"><div class="spinner"></div><div>Loading\u2026</div></div></div>
+    <button class="pv-arrow pv-next" title="Next (\u2192)">&#8594;</button>
+  </div>`);
     document.body.append(m);
-    let url;
+    let url = null, currentIt = it, loading = false;
+    const updateArrows = () => {
+      const list = previewableItems(), idx = list.findIndex((x) => x.id === currentIt.id);
+      m.querySelector(".pv-prev").disabled = idx <= 0;
+      m.querySelector(".pv-next").disabled = idx < 0 || idx >= list.length - 1;
+    };
     const close = () => {
       m.remove();
-      url && URL.revokeObjectURL(url);
-      document.removeEventListener("keydown", esc_);
+      if (url && !previewCache.has(currentIt.id)) URL.revokeObjectURL(url);
+      document.removeEventListener("keydown", keys_);
     };
-    const esc_ = (e) => {
-      if (e.key === "Escape") close();
+    const loadItem = async (item) => {
+      if (loading) return;
+      loading = true;
+      currentIt = item;
+      if (url && !previewCache.has(item.id)) {
+        URL.revokeObjectURL(url);
+      }
+      url = null;
+      const content = m.querySelector(".pv-content");
+      updateArrows();
+      const cached = previewCache.get(item.id);
+      if (cached) {
+        url = cached.url;
+        const mime = item.enc ? item.meta && item.meta.t || "" : item.plainMime || "";
+        const tag = mime.startsWith("image/") ? `<img src="${url}" alt="">` : mime.startsWith("video/") ? `<video src="${url}" controls autoplay></video>` : `<audio src="${url}" controls autoplay></audio>`;
+        content.replaceChildren(h(tag), h(`<div class="pv-bar"><span class="pv-name">${esc(nameOf(item))}</span><button class="btn small" id="pvdl">Download</button><button class="btn small" id="pvcl">Close</button></div>`));
+        content.querySelector("#pvdl").onclick = () => saveBlob(cached.blob, nameOf(item));
+        content.querySelector("#pvcl").onclick = close;
+        loading = false;
+        const list = previewableItems(), idx = list.findIndex((x) => x.id === item.id);
+        for (const nb of [list[idx - 1], list[idx + 1]]) {
+          if (nb && !previewCache.has(nb.id) && nb.sizeOf <= PREVIEW_MAX) {
+            tg.downloadDecrypted(nb).then((b) => {
+              if (!previewCache.has(nb.id)) previewCache.set(nb.id, { url: URL.createObjectURL(b), blob: b });
+            }).catch(() => {
+            });
+          }
+        }
+        return;
+      }
+      content.replaceChildren(h(`<div class="box"><div class="spinner"></div><div>Loading\u2026</div></div>`));
+      try {
+        const mime = item.enc ? item.meta && item.meta.t || "" : item.plainMime || "";
+        const blob = await tg.downloadDecrypted(item);
+        url = URL.createObjectURL(blob);
+        previewCache.set(item.id, { url, blob });
+        const tag = mime.startsWith("image/") ? `<img src="${url}" alt="">` : mime.startsWith("video/") ? `<video src="${url}" controls autoplay></video>` : `<audio src="${url}" controls autoplay></audio>`;
+        content.replaceChildren(
+          h(tag),
+          h(`<div class="pv-bar"><span class="pv-name">${esc(nameOf(item))}</span><button class="btn small" id="pvdl">Download</button><button class="btn small" id="pvcl">Close</button></div>`)
+        );
+        content.querySelector("#pvdl").onclick = () => saveBlob(blob, nameOf(item));
+        content.querySelector("#pvcl").onclick = close;
+        const list = previewableItems(), idx = list.findIndex((x) => x.id === item.id);
+        for (const nb of [list[idx - 1], list[idx + 1]]) {
+          if (nb && !previewCache.has(nb.id) && sizeOf(nb) <= PREVIEW_MAX) {
+            tg.downloadDecrypted(nb).then((b) => {
+              if (!previewCache.has(nb.id)) previewCache.set(nb.id, { url: URL.createObjectURL(b), blob: b });
+            }).catch(() => {
+            });
+          }
+        }
+      } catch (e) {
+        toast("Preview failed: " + errMsg(e));
+        close();
+      }
+      loading = false;
     };
-    document.addEventListener("keydown", esc_);
+    const goDir = (dir) => {
+      const list = previewableItems(), idx = list.findIndex((x) => x.id === currentIt.id);
+      const next = list[idx + dir];
+      if (next) loadItem(next);
+    };
+    m.querySelector(".pv-prev").onclick = () => goDir(-1);
+    m.querySelector(".pv-next").onclick = () => goDir(1);
     m.onclick = (e) => {
       if (e.target === m) close();
     };
-    try {
-      const blob = await tg.downloadDecrypted(it);
-      url = URL.createObjectURL(blob);
-      const tag = k.startsWith("image/") ? `<img src="${url}" alt="">` : k.startsWith("video/") ? `<video src="${url}" controls autoplay></video>` : `<audio src="${url}" controls autoplay></audio>`;
-      m.firstChild.replaceChildren(h(tag), h(`<div class="row"><span>${esc(nameOf(it))}</span><button class="btn small">Download</button><button class="btn small">Close</button></div>`));
-      const [dl, cl] = m.querySelectorAll("button");
-      dl.onclick = () => saveBlob(blob, nameOf(it));
-      cl.onclick = close;
-    } catch (e) {
-      toast("Preview failed: " + errMsg(e));
-      close();
-    }
+    const keys_ = (e) => {
+      if (e.key === "Escape") close();
+      else if (e.key === "ArrowLeft") goDir(-1);
+      else if (e.key === "ArrowRight") goDir(1);
+    };
+    document.addEventListener("keydown", keys_);
+    await loadItem(it);
   }
   var lastSync = 0;
   async function syncNow(manual) {
@@ -71837,8 +71968,31 @@ ${skipped} file(s) are nested too deeply and will be skipped.` : "");
       }
       await persistSession();
       tg.startLive();
-      showLibrary();
-      await tg.loadMore();
+      const hadCache = await tg.loadCache();
+      if (hadCache) {
+        showLibrary();
+        const indicator = Object.assign(document.createElement("div"), {
+          id: "cacheRefresh",
+          textContent: "Syncing\u2026",
+          style: "position:fixed;bottom:12px;right:16px;font-size:12px;color:var(--fg2,#888);pointer-events:none;z-index:9999"
+        });
+        document.body.appendChild(indicator);
+        const loadAll = async () => {
+          try {
+            while (tg.hasMore) {
+              await tg.loadMore();
+              await new Promise((r) => setTimeout(r, 400));
+            }
+          } catch {
+          } finally {
+            indicator.remove();
+          }
+        };
+        loadAll();
+      } else {
+        showLibrary();
+        await tg.loadMore();
+      }
       addEventListener("focus", () => syncNow(false));
       setInterval(() => persistSession().catch(() => {
       }), 6e4);

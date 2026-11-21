@@ -6,7 +6,7 @@ import { generateRandomLong } from 'telegram/Helpers';
 import bigInt from 'big-integer';
 import {
   encryptFile, encryptMeta, decryptMeta, saltFromCaption, decryptThumb, Decryptor, isVaultCaption, THUMB_FETCH,
-  fitMeta, metaFits, utf8Len, PATH_MAX_BYTES,
+  fitMeta, metaFits, utf8Len, PATH_MAX_BYTES, sealString, openString,
 } from './crypto.js';
 
 const PART = 512 * 1024;
@@ -87,6 +87,7 @@ export class TG {
     await Promise.all([this._page('doc'), this._page('photo')]);
     await this._decryptMetas();
     this.onChange();
+    this.saveCache(); // async, non-blocking
   }
   get hasMore() { return !(this.cursors.doc.done && this.cursors.photo.done); }
   async refresh() {
@@ -105,6 +106,7 @@ export class TG {
     }
     await this._decryptMetas();
     this.onChange();
+    this.saveCache(); // async, non-blocking
   }
   async _decryptMetas() {
     if (!this.master) return;
@@ -137,6 +139,55 @@ export class TG {
         let ch = false; for (const id of u.messages) ch = this.items.delete(id) || ch; if (ch) this.onChange();
       }
     }, new Raw({ types: [Api.UpdateDeleteMessages] }));
+  }
+
+  // ---------- file-list cache ----------
+  // Cache is stored in chrome.storage.local as sealed JSON, keyed per user.
+  // This lets the vault show files instantly from cache while refreshing in background.
+  _cacheKey() { return 'flist_' + (this.userId || 'anon'); }
+
+  async saveCache() {
+    if (!this.master || !this.userId) return;
+    try {
+      // Serialise only the info needed to render: id, date, enc, cap, size, isPhoto, plainName, plainMime, meta
+      const rows = [];
+      for (const it of this.items.values()) {
+        const row = {
+          id: it.id, date: it.date, enc: it.enc, cap: it.cap,
+          size: it.size, isPhoto: it.isPhoto, plainName: it.plainName, plainMime: it.plainMime,
+        };
+        if (it.meta) row.meta = it.meta;
+        rows.push(row);
+      }
+      const cursors = JSON.parse(JSON.stringify(this.cursors));
+      const payload = JSON.stringify({ rows, cursors, ts: Date.now() });
+      const sealed = await sealString(this.master, payload);
+      await chrome.storage.local.set({ [this._cacheKey()]: sealed });
+    } catch { /* non-fatal */ }
+  }
+
+  async loadCache() {
+    if (!this.master || !this.userId) return false;
+    try {
+      const stored = await chrome.storage.local.get(this._cacheKey());
+      const sealed = stored[this._cacheKey()];
+      if (!sealed) return false;
+      const payload = await openString(this.master, sealed);
+      const { rows, cursors } = JSON.parse(payload);
+      for (const row of rows) {
+        const it = { ...row };
+        // msg object is not cached (too large); create a minimal stub so size/name lookups still work
+        it.msg = null;
+        this.items.set(it.id, it);
+      }
+      // Restore cursor positions so loadMore continues from where we left off
+      if (cursors) this.cursors = cursors;
+      return true;
+    } catch { return false; }
+  }
+
+  async clearCache() {
+    try { await chrome.storage.local.remove(this._cacheKey()); } catch { /* non-fatal */ }
   }
 
   // ---------- upload ----------

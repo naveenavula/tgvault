@@ -35,6 +35,7 @@ async function persistSession() {
   savedSession = cur;
 }
 async function wipeLocal() {
+  await tg.clearCache();
   await store.clear(); if (mem) await mem.clear();
   try { indexedDB.deleteDatabase('tgvault'); } catch { /* older versions kept the key here */ }
 }
@@ -166,7 +167,8 @@ function videoFrame(file) {
     setTimeout(() => done(reject, new Error('timeout')), 6000);
   });
 }
-const thumbCache = new Map(); // id -> object URL
+const thumbCache = new Map();   // id -> object URL (thumbnail)
+const previewCache = new Map(); // id -> { url, blob } (full preview, in-memory only)
 let thumbBusy = 0; const thumbQueue = [];
 function requestThumb(it, imgEl) {
   if (thumbCache.has(it.id)) { imgEl.src = thumbCache.get(it.id); return; }
@@ -654,21 +656,114 @@ async function encryptExisting(it) {
     await tg.remove([it.id]); toast('Encrypted ✓ — original removed');
   } catch (e) { toast('Failed: ' + errMsg(e)); }
 }
+function previewableItems() {
+  return visibleItems().filter((it) => {
+    const k = it.enc ? (it.meta && it.meta.t) || '' : it.plainMime || '';
+    return k.startsWith('image/') || k.startsWith('video/') || k.startsWith('audio/');
+  });
+}
+
 async function openPreview(it) {
   const k = it.enc ? (it.meta && it.meta.t) || '' : it.plainMime || '';
   if (!(k.startsWith('image/') || k.startsWith('video/') || k.startsWith('audio/'))) return downloadItem(it);
   if (sizeOf(it) > PREVIEW_MAX) { toast('Too large to preview here — downloading instead.'); return downloadItem(it); }
-  const m = h(`<div class="modal"><div class="box"><div class="spinner"></div><div>Loading…</div></div></div>`);
-  document.body.append(m); let url;
-  const close = () => { m.remove(); url && URL.revokeObjectURL(url); document.removeEventListener('keydown', esc_); };
-  const esc_ = (e) => { if (e.key === 'Escape') close(); }; document.addEventListener('keydown', esc_);
+
+  // Build the modal shell with arrow buttons
+  const m = h(`<div class="modal pv-modal">
+    <button class="pv-arrow pv-prev" title="Previous (←)">&#8592;</button>
+    <div class="pv-content"><div class="box"><div class="spinner"></div><div>Loading…</div></div></div>
+    <button class="pv-arrow pv-next" title="Next (→)">&#8594;</button>
+  </div>`);
+  document.body.append(m);
+
+  let url = null, currentIt = it, loading = false;
+
+  const updateArrows = () => {
+    const list = previewableItems(), idx = list.findIndex((x) => x.id === currentIt.id);
+    m.querySelector('.pv-prev').disabled = idx <= 0;
+    m.querySelector('.pv-next').disabled = idx < 0 || idx >= list.length - 1;
+  };
+
+  const close = () => {
+    m.remove();
+    // Only revoke if not in the persistent preview cache
+    if (url && !previewCache.has(currentIt.id)) URL.revokeObjectURL(url);
+    document.removeEventListener('keydown', keys_);
+  };
+
+  const loadItem = async (item) => {
+    if (loading) return; loading = true; currentIt = item;
+    // Don't revoke cached URLs — they're shared
+    if (url && !previewCache.has(item.id)) { URL.revokeObjectURL(url); }
+    url = null;
+    const content = m.querySelector('.pv-content');
+    updateArrows();
+
+    // Show cached preview instantly if available
+    const cached = previewCache.get(item.id);
+    if (cached) {
+      url = cached.url;
+      const mime = item.enc ? (item.meta && item.meta.t) || '' : item.plainMime || '';
+      const tag = mime.startsWith('image/') ? `<img src="${url}" alt="">` : mime.startsWith('video/') ? `<video src="${url}" controls autoplay></video>` : `<audio src="${url}" controls autoplay></audio>`;
+      content.replaceChildren(h(tag), h(`<div class="pv-bar"><span class="pv-name">${esc(nameOf(item))}</span><button class="btn small" id="pvdl">Download</button><button class="btn small" id="pvcl">Close</button></div>`));
+      content.querySelector('#pvdl').onclick = () => saveBlob(cached.blob, nameOf(item));
+      content.querySelector('#pvcl').onclick = close;
+      loading = false;
+      // Prefetch neighbours quietly in background
+      const list = previewableItems(), idx = list.findIndex((x) => x.id === item.id);
+      for (const nb of [list[idx - 1], list[idx + 1]]) {
+        if (nb && !previewCache.has(nb.id) && nb.sizeOf <= PREVIEW_MAX) {
+          tg.downloadDecrypted(nb).then((b) => {
+            if (!previewCache.has(nb.id)) previewCache.set(nb.id, { url: URL.createObjectURL(b), blob: b });
+          }).catch(() => {});
+        }
+      }
+      return;
+    }
+
+    content.replaceChildren(h(`<div class="box"><div class="spinner"></div><div>Loading…</div></div>`));
+    try {
+      const mime = item.enc ? (item.meta && item.meta.t) || '' : item.plainMime || '';
+      const blob = await tg.downloadDecrypted(item);
+      url = URL.createObjectURL(blob);
+      previewCache.set(item.id, { url, blob }); // store for instant re-open
+      const tag = mime.startsWith('image/') ? `<img src="${url}" alt="">` : mime.startsWith('video/') ? `<video src="${url}" controls autoplay></video>` : `<audio src="${url}" controls autoplay></audio>`;
+      content.replaceChildren(
+        h(tag),
+        h(`<div class="pv-bar"><span class="pv-name">${esc(nameOf(item))}</span><button class="btn small" id="pvdl">Download</button><button class="btn small" id="pvcl">Close</button></div>`),
+      );
+      content.querySelector('#pvdl').onclick = () => saveBlob(blob, nameOf(item));
+      content.querySelector('#pvcl').onclick = close;
+      // Prefetch neighbours quietly
+      const list = previewableItems(), idx = list.findIndex((x) => x.id === item.id);
+      for (const nb of [list[idx - 1], list[idx + 1]]) {
+        if (nb && !previewCache.has(nb.id) && sizeOf(nb) <= PREVIEW_MAX) {
+          tg.downloadDecrypted(nb).then((b) => {
+            if (!previewCache.has(nb.id)) previewCache.set(nb.id, { url: URL.createObjectURL(b), blob: b });
+          }).catch(() => {});
+        }
+      }
+    } catch (e) { toast('Preview failed: ' + errMsg(e)); close(); }
+    loading = false;
+  };
+
+  const goDir = (dir) => {
+    const list = previewableItems(), idx = list.findIndex((x) => x.id === currentIt.id);
+    const next = list[idx + dir]; if (next) loadItem(next);
+  };
+
+  m.querySelector('.pv-prev').onclick = () => goDir(-1);
+  m.querySelector('.pv-next').onclick = () => goDir(1);
   m.onclick = (e) => { if (e.target === m) close(); };
-  try {
-    const blob = await tg.downloadDecrypted(it); url = URL.createObjectURL(blob);
-    const tag = k.startsWith('image/') ? `<img src="${url}" alt="">` : k.startsWith('video/') ? `<video src="${url}" controls autoplay></video>` : `<audio src="${url}" controls autoplay></audio>`;
-    m.firstChild.replaceChildren(h(tag), h(`<div class="row"><span>${esc(nameOf(it))}</span><button class="btn small">Download</button><button class="btn small">Close</button></div>`));
-    const [dl, cl] = m.querySelectorAll('button'); dl.onclick = () => saveBlob(blob, nameOf(it)); cl.onclick = close;
-  } catch (e) { toast('Preview failed: ' + errMsg(e)); close(); }
+
+  const keys_ = (e) => {
+    if (e.key === 'Escape') close();
+    else if (e.key === 'ArrowLeft') goDir(-1);
+    else if (e.key === 'ArrowRight') goDir(1);
+  };
+  document.addEventListener('keydown', keys_);
+
+  await loadItem(it);
 }
 
 // ---------- sync / logout ----------
@@ -738,8 +833,29 @@ async function doLogout() {
     await persistSession();
 
     tg.startLive();
-    showLibrary();
-    await tg.loadMore();
+
+    // Try the cache first so the library appears instantly.
+    const hadCache = await tg.loadCache();
+    if (hadCache) {
+      showLibrary();
+      // Refresh from Telegram in the background; show a subtle indicator while it runs.
+      const indicator = Object.assign(document.createElement('div'), {
+        id: 'cacheRefresh',
+        textContent: 'Syncing…',
+        style: 'position:fixed;bottom:12px;right:16px;font-size:12px;color:var(--fg2,#888);pointer-events:none;z-index:9999',
+      });
+      document.body.appendChild(indicator);
+      // Load pages one at a time with a short pause so the connection stays free for preview downloads
+      const loadAll = async () => {
+        try {
+          while (tg.hasMore) { await tg.loadMore(); await new Promise((r) => setTimeout(r, 400)); }
+        } catch { /* non-fatal */ } finally { indicator.remove(); }
+      };
+      loadAll();
+    } else {
+      showLibrary();
+      await tg.loadMore();
+    }
     addEventListener('focus', () => syncNow(false));
     setInterval(() => persistSession().catch(() => {}), 60000);
   } catch (e) {
