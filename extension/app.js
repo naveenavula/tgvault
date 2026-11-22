@@ -70386,7 +70386,7 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
       const me = this.me.id;
       const isSaved = (m) => m && m.peerId && num(m.peerId.userId) === num(me);
       this.client.addEventHandler(async (ev) => {
-        if (isSaved(ev.message) && this._ingest(ev.message)) {
+        if (isSaved(ev.message) && !this.items.has(ev.message.id) && this._ingest(ev.message)) {
           await this._decryptMetas();
           this.onChange();
         }
@@ -70548,17 +70548,19 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
         message: caption,
         randomId: (0, import_Helpers.generateRandomLong)()
       }));
-      let id = null;
+      let msg = null;
       for (const u of res.updates || []) {
-        if (u.message && u.message.id && u.className.includes("NewMessage")) id = u.message.id;
+        if (u.message && u.message.id && u.message.media && u.className.includes("NewMessage")) msg = u.message;
       }
-      if (id) {
-        const [m] = await this.client.getMessages("me", { ids: [id] });
-        this._ingest(m);
+      if (msg && this._ingest(msg)) {
+        await this._decryptMetas();
+        this.onChange();
+      } else if (msg) {
+        const [m] = await this.client.getMessages("me", { ids: [msg.id] });
+        if (m) this._ingest(m);
         await this._decryptMetas();
         this.onChange();
       } else await this.refresh();
-      this.saveSession();
     }
     // ---------- download ----------
     async _fresh(it) {
@@ -71551,7 +71553,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       }
     };
     let shownPath = state.path;
-    tg.onChange = () => {
+    const doRender = () => {
       if (state.path && !allFolders().includes(state.path)) state.path = "";
       if (state.path !== shownPath) {
         shownPath = state.path;
@@ -71563,7 +71565,21 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       if (m) m.hidden = !tg.hasMore;
       prefetchVisible();
     };
-    tg.onChange();
+    let renderTimer = null;
+    tg.onChange = () => {
+      if (state.path !== shownPath) {
+        clearTimeout(renderTimer);
+        renderTimer = null;
+        doRender();
+        return;
+      }
+      if (renderTimer) return;
+      renderTimer = setTimeout(() => {
+        renderTimer = null;
+        doRender();
+      }, 250);
+    };
+    doRender();
   }
   var dragDepth = 0;
   addEventListener("dragenter", (e) => {
@@ -71687,23 +71703,52 @@ ${skipped} file(s) are nested too deeply and will be skipped.` : "");
     for (const x of list) pending.push(x instanceof Blob ? { file: x, path: state.path } : x);
     runQueue();
   }
+  var UPLOAD_PARALLEL = 3;
   async function runQueue() {
     if (running) return;
     running = true;
     let ok = 0, failed = 0;
-    while (pending.length) {
-      const jobSpec = pending.shift();
-      if (jobSpec.folder) {
-        if (!allFolders().includes(jobSpec.folder)) {
-          try {
-            await tg.createFolder(jobSpec.folder);
-          } catch (e) {
-            toast("Could not create folder: " + errMsg(e));
-          }
-        }
+    for (let i = 0; i < pending.length; ) {
+      const f = pending[i].folder;
+      if (!f) {
+        i++;
         continue;
       }
-      const { file, path } = jobSpec;
+      pending.splice(i, 1);
+      if (!allFolders().includes(f)) {
+        try {
+          await tg.createFolder(f);
+        } catch (e) {
+          toast("Could not create folder: " + errMsg(e));
+        }
+      }
+    }
+    const worker = async () => {
+      for (; ; ) {
+        const jobSpec = pending.shift();
+        if (!jobSpec) return;
+        if (jobSpec.folder) {
+          if (!allFolders().includes(jobSpec.folder)) {
+            try {
+              await tg.createFolder(jobSpec.folder);
+            } catch (e) {
+              toast("Could not create folder: " + errMsg(e));
+            }
+          }
+          continue;
+        }
+        const r = await uploadOne(jobSpec);
+        if (r) ok++;
+        else failed++;
+      }
+    };
+    await Promise.all(Array.from({ length: UPLOAD_PARALLEL }, worker));
+    running = false;
+    if (pending.length) return runQueue();
+    if (ok + failed > 1) toast(failed ? `Uploaded ${ok}, ${failed} failed (see the messages bottom-right)` : `Uploaded ${ok} files \u2713`);
+  }
+  async function uploadOne({ file, path }) {
+    {
       const q = document.getElementById("queue");
       const where = path && path !== state.path ? ` <span class="sub">\u2192 \u{1F4C1} ${esc(path)}</span>` : "";
       const job = h(`<div class="job"><div class="name">${esc(file.name)}${where}</div><div class="sub" data-s>Preparing\u2026</div><div class="bar"><i></i></div><div class="sub" data-left></div></div>`);
@@ -71720,22 +71765,21 @@ ${skipped} file(s) are nested too deeply and will be skipped.` : "");
         job.querySelector("i").style.width = Math.round(f * 100) + "%";
         showLeft();
       };
+      let success = false;
       try {
         const thumb = await makeThumb(file);
         await tg.uploadFile(file, thumb, path ? { p: path } : {}, (stage, f) => setP(stage === "encrypt" ? "Encrypting\u2026" : "Uploading to Telegram\u2026", stage === "encrypt" ? f * 0.3 : 0.3 + f * 0.7));
         setP("Done \u2713", 1);
-        ok++;
+        success = true;
         setTimeout(() => job.remove(), 1500);
       } catch (e) {
-        failed++;
         setP("Failed: " + errMsg(e), 0);
         job.querySelector("i").style.background = "var(--danger)";
         setTimeout(() => job.remove(), 9e3);
       }
       activeJobs--;
+      return success;
     }
-    running = false;
-    if (ok + failed > 1) toast(failed ? `Uploaded ${ok}, ${failed} failed (see the messages bottom-right)` : `Uploaded ${ok} files \u2713`);
   }
   function saveBlob(blob, name) {
     const url = URL.createObjectURL(blob);

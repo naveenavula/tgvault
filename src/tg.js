@@ -132,7 +132,8 @@ export class TG {
     const me = this.me.id;
     const isSaved = (m) => m && m.peerId && num(m.peerId.userId) === num(me);
     this.client.addEventHandler(async (ev) => {
-      if (isSaved(ev.message) && this._ingest(ev.message)) { await this._decryptMetas(); this.onChange(); }
+      // Skip messages we already have (e.g. our own uploads, already ingested from the send reply)
+      if (isSaved(ev.message) && !this.items.has(ev.message.id) && this._ingest(ev.message)) { await this._decryptMetas(); this.onChange(); }
     }, new NewMessage({}));
     this.client.addEventHandler(async (u) => {
       if (u instanceof Api.UpdateDeleteMessages) {
@@ -283,11 +284,12 @@ export class TG {
       }),
       message: caption, randomId: generateRandomLong(),
     }));
-    let id = null;
-    for (const u of res.updates || []) { if (u.message && u.message.id && u.className.includes('NewMessage')) id = u.message.id; }
-    if (id) { const [m] = await this.client.getMessages('me', { ids: [id] }); this._ingest(m); await this._decryptMetas(); this.onChange(); }
+    // The reply already carries the new message — ingest it directly instead of paying another round trip.
+    let msg = null;
+    for (const u of res.updates || []) { if (u.message && u.message.id && u.message.media && u.className.includes('NewMessage')) msg = u.message; }
+    if (msg && this._ingest(msg)) { await this._decryptMetas(); this.onChange(); }
+    else if (msg) { const [m] = await this.client.getMessages('me', { ids: [msg.id] }); if (m) this._ingest(m); await this._decryptMetas(); this.onChange(); }
     else await this.refresh();
-    this.saveSession();
   }
 
   // ---------- download ----------

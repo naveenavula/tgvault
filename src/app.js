@@ -482,13 +482,21 @@ function showLibrary() {
   $('#lo').onclick = () => doLogout();
   $('#more').onclick = async () => { $('#more').disabled = true; try { await tg.loadMore(); } finally { $('#more').disabled = false; } };
   let shownPath = state.path;
-  tg.onChange = () => {
+  const doRender = () => {
     if (state.path && !allFolders().includes(state.path)) state.path = '';
     if (state.path !== shownPath) { shownPath = state.path; state.sel.clear(); lastPicked = null; }   // new folder, fresh selection
     renderGrid(); const m = $('#more'); if (m) m.hidden = !tg.hasMore;
     prefetchVisible(); // batch-fetch msg objects so thumbnails load without individual round-trips
   };
-  tg.onChange();
+  // Coalesce bursts of changes (e.g. many uploads finishing) into one render per ~250 ms.
+  // Navigation (path changed) still renders immediately.
+  let renderTimer = null;
+  tg.onChange = () => {
+    if (state.path !== shownPath) { clearTimeout(renderTimer); renderTimer = null; doRender(); return; }
+    if (renderTimer) return;
+    renderTimer = setTimeout(() => { renderTimer = null; doRender(); }, 250);
+  };
+  doRender();
 }
 
 // drag & drop + paste (registered once)
@@ -575,16 +583,35 @@ function uploadTree(files, dirs, label) {
 let activeJobs = 0; const pending = []; let running = false;
 /** Accepts Files (go into the current folder) or {file, path} / {folder} jobs. */
 function enqueue(list) { for (const x of list) pending.push(x instanceof Blob ? { file: x, path: state.path } : x); runQueue(); }
+const UPLOAD_PARALLEL = 3;   // files uploaded at the same time (each file also uploads its parts 4-wide)
 async function runQueue() {
   if (running) return; running = true;
   let ok = 0, failed = 0;
-  while (pending.length) {
-    const jobSpec = pending.shift();
-    if (jobSpec.folder) {
-      if (!allFolders().includes(jobSpec.folder)) { try { await tg.createFolder(jobSpec.folder); } catch (e) { toast('Could not create folder: ' + errMsg(e)); } }
-      continue;
+  // Create empty folders first (cheap, and keeps the tree visible while files stream in)
+  for (let i = 0; i < pending.length;) {
+    const f = pending[i].folder;
+    if (!f) { i++; continue; }
+    pending.splice(i, 1);
+    if (!allFolders().includes(f)) { try { await tg.createFolder(f); } catch (e) { toast('Could not create folder: ' + errMsg(e)); } }
+  }
+  const worker = async () => {
+    for (;;) {
+      const jobSpec = pending.shift(); if (!jobSpec) return;
+      if (jobSpec.folder) {
+        if (!allFolders().includes(jobSpec.folder)) { try { await tg.createFolder(jobSpec.folder); } catch (e) { toast('Could not create folder: ' + errMsg(e)); } }
+        continue;
+      }
+      const r = await uploadOne(jobSpec);
+      if (r) ok++; else failed++;
     }
-    const { file, path } = jobSpec;
+  };
+  await Promise.all(Array.from({ length: UPLOAD_PARALLEL }, worker));
+  running = false;
+  if (pending.length) return runQueue();   // more files were added while the last ones finished
+  if (ok + failed > 1) toast(failed ? `Uploaded ${ok}, ${failed} failed (see the messages bottom-right)` : `Uploaded ${ok} files ✓`);
+}
+async function uploadOne({ file, path }) {
+  {
     const q = document.getElementById('queue');
     const where = path && path !== state.path ? ` <span class="sub">→ 📁 ${esc(path)}</span>` : '';
     const job = h(`<div class="job"><div class="name">${esc(file.name)}${where}</div><div class="sub" data-s>Preparing…</div><div class="bar"><i></i></div><div class="sub" data-left></div></div>`);
@@ -592,15 +619,15 @@ async function runQueue() {
     const left = job.querySelector('[data-left]'); const showLeft = () => { const n = pending.filter((p) => p.file).length; left.textContent = n ? `${n} more waiting` : ''; };
     showLeft();
     const setP = (label, f) => { job.querySelector('[data-s]').textContent = label; job.querySelector('i').style.width = Math.round(f * 100) + '%'; showLeft(); };
+    let success = false;
     try {
       const thumb = await makeThumb(file);
       await tg.uploadFile(file, thumb, path ? { p: path } : {}, (stage, f) => setP(stage === 'encrypt' ? 'Encrypting…' : 'Uploading to Telegram…', stage === 'encrypt' ? f * 0.3 : 0.3 + f * 0.7));
-      setP('Done ✓', 1); ok++; setTimeout(() => job.remove(), 1500);
-    } catch (e) { failed++; setP('Failed: ' + errMsg(e), 0); job.querySelector('i').style.background = 'var(--danger)'; setTimeout(() => job.remove(), 9000); }
+      setP('Done ✓', 1); success = true; setTimeout(() => job.remove(), 1500);
+    } catch (e) { setP('Failed: ' + errMsg(e), 0); job.querySelector('i').style.background = 'var(--danger)'; setTimeout(() => job.remove(), 9000); }
     activeJobs--;
+    return success;
   }
-  running = false;
-  if (ok + failed > 1) toast(failed ? `Uploaded ${ok}, ${failed} failed (see the messages bottom-right)` : `Uploaded ${ok} files ✓`);
 }
 
 // ---------- item actions ----------
