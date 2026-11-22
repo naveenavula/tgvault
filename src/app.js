@@ -171,16 +171,25 @@ const thumbCache = new Map();   // id -> object URL (thumbnail)
 const previewCache = new Map(); // id -> { url, blob } (full preview, in-memory only)
 let thumbBusy = 0; const thumbQueue = [];
 function requestThumb(it, imgEl) {
-  if (thumbCache.has(it.id)) { imgEl.src = thumbCache.get(it.id); return; }
+  if (thumbCache.has(it.id)) { imgEl.src = thumbCache.get(it.id); imgEl.hidden = false; return; }
   thumbQueue.push({ it, imgEl }); pumpThumbs();
 }
 function pumpThumbs() {
-  while (thumbBusy < 3 && thumbQueue.length) {
+  while (thumbBusy < 8 && thumbQueue.length) {   // 8 concurrent thumbnail downloads
     const { it, imgEl } = thumbQueue.shift(); thumbBusy++;
     tg.thumbnail(it).then((blob) => {
-      if (!blob) return; const url = URL.createObjectURL(blob); thumbCache.set(it.id, url); imgEl.src = url; imgEl.hidden = false;
+      if (!blob) return; const url = URL.createObjectURL(blob); thumbCache.set(it.id, url);
+      if (imgEl.isConnected) { imgEl.src = url; imgEl.hidden = false; }
     }).catch(() => {}).finally(() => { thumbBusy--; pumpThumbs(); });
   }
+}
+/** Before rendering a folder, batch-fetch message objects for visible items that came from cache.
+ *  This turns N×getMessages round-trips (one per thumbnail) into one batched call. */
+async function prefetchVisible() {
+  const ids = visibleItems()
+    .filter((it) => it.isPhoto || (it.enc && it.meta && it.meta.th))
+    .map((it) => it.id);
+  if (ids.length) tg.prefetchMsgs(ids).catch(() => {});
 }
 
 // ---------- library ----------
@@ -472,7 +481,9 @@ function showLibrary() {
   tg.onChange = () => {
     if (state.path && !allFolders().includes(state.path)) state.path = '';
     if (state.path !== shownPath) { shownPath = state.path; state.sel.clear(); lastPicked = null; }   // new folder, fresh selection
-    renderGrid(); const m = $('#more'); if (m) m.hidden = !tg.hasMore; };
+    renderGrid(); const m = $('#more'); if (m) m.hidden = !tg.hasMore;
+    prefetchVisible(); // batch-fetch msg objects so thumbnails load without individual round-trips
+  };
   tg.onChange();
 }
 

@@ -70519,10 +70519,25 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
     }
     // ---------- download ----------
     async _fresh(it) {
+      if (it.msg && it.msg.media) return it;
       const [m] = await this.client.getMessages("me", { ids: [it.id] });
       if (!m || !m.media) throw new Error("Message no longer exists");
       this._ingest(m);
       return this.items.get(it.id);
+    }
+    /** Pre-fetch message objects for a batch of items that came from cache (msg === null).
+     *  Call this before thumbnail loading so each thumbnail skips its own getMessages round-trip. */
+    async prefetchMsgs(ids) {
+      const missing = ids.filter((id) => {
+        const it = this.items.get(id);
+        return it && !it.msg;
+      });
+      if (!missing.length) return;
+      for (let i = 0; i < missing.length; i += 100) {
+        const slice = missing.slice(i, i + 100);
+        const msgs = await this.client.getMessages("me", { ids: slice });
+        for (const m of msgs) if (m && m.media) this._ingest(m);
+      }
     }
     async *_stream(it, requestSize = PART) {
       it = await this._fresh(it);
@@ -71005,27 +71020,35 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
   function requestThumb(it, imgEl) {
     if (thumbCache.has(it.id)) {
       imgEl.src = thumbCache.get(it.id);
+      imgEl.hidden = false;
       return;
     }
     thumbQueue.push({ it, imgEl });
     pumpThumbs();
   }
   function pumpThumbs() {
-    while (thumbBusy < 3 && thumbQueue.length) {
+    while (thumbBusy < 8 && thumbQueue.length) {
       const { it, imgEl } = thumbQueue.shift();
       thumbBusy++;
       tg.thumbnail(it).then((blob) => {
         if (!blob) return;
         const url = URL.createObjectURL(blob);
         thumbCache.set(it.id, url);
-        imgEl.src = url;
-        imgEl.hidden = false;
+        if (imgEl.isConnected) {
+          imgEl.src = url;
+          imgEl.hidden = false;
+        }
       }).catch(() => {
       }).finally(() => {
         thumbBusy--;
         pumpThumbs();
       });
     }
+  }
+  async function prefetchVisible() {
+    const ids = visibleItems().filter((it) => it.isPhoto || it.enc && it.meta && it.meta.th).map((it) => it.id);
+    if (ids.length) tg.prefetchMsgs(ids).catch(() => {
+    });
   }
   function kindOf(it) {
     const t = it.enc ? it.meta && it.meta.t || "" : it.plainMime || "";
@@ -71493,6 +71516,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       renderGrid();
       const m = $("#more");
       if (m) m.hidden = !tg.hasMore;
+      prefetchVisible();
     };
     tg.onChange();
   }

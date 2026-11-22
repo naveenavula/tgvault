@@ -245,9 +245,21 @@ export class TG {
 
   // ---------- download ----------
   async _fresh(it) {
+    if (it.msg && it.msg.media) return it; // already have the media object, skip network call
     const [m] = await this.client.getMessages('me', { ids: [it.id] });
     if (!m || !m.media) throw new Error('Message no longer exists');
     this._ingest(m); return this.items.get(it.id);
+  }
+  /** Pre-fetch message objects for a batch of items that came from cache (msg === null).
+   *  Call this before thumbnail loading so each thumbnail skips its own getMessages round-trip. */
+  async prefetchMsgs(ids) {
+    const missing = ids.filter((id) => { const it = this.items.get(id); return it && !it.msg; });
+    if (!missing.length) return;
+    for (let i = 0; i < missing.length; i += 100) {
+      const slice = missing.slice(i, i + 100);
+      const msgs = await this.client.getMessages('me', { ids: slice });
+      for (const m of msgs) if (m && m.media) this._ingest(m);
+    }
   }
   async *_stream(it, requestSize = PART) {
     it = await this._fresh(it);
