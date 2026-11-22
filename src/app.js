@@ -492,6 +492,7 @@ function showLibrary() {
   // Navigation (path changed) still renders immediately.
   let renderTimer = null;
   tg.onChange = () => {
+    tg.saveCacheSoon();   // keep the encrypted file-list cache in step with uploads, moves, deletes
     if (state.path !== shownPath) { clearTimeout(renderTimer); renderTimer = null; doRender(); return; }
     if (renderTimer) return;
     renderTimer = setTimeout(() => { renderTimer = null; doRender(); }, 250);
@@ -518,7 +519,7 @@ addEventListener('drop', (e) => {
   if (e.dataTransfer.files.length) enqueue([...e.dataTransfer.files]);
 });
 addEventListener('paste', (e) => { if (!tg.master || e.target.tagName === 'INPUT') return; const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { enqueue(fs.map((f, i) => (f.name === 'image.png' ? new File([f], `pasted-${Date.now()}-${i}.png`, { type: f.type }) : f))); } });
-addEventListener('beforeunload', (e) => { if (activeJobs > 0) { e.preventDefault(); e.returnValue = ''; } });
+addEventListener('beforeunload', (e) => { if (activeJobs > 0 || pending.length > 0) { e.preventDefault(); e.returnValue = ''; } });
 
 // ---------- upload queue ----------
 // ---------- folder upload ----------
@@ -559,11 +560,16 @@ async function collectEntries(entries) {
 }
 /** Queue a folder tree for upload into the current folder, recreating its subfolders. */
 function uploadTree(files, dirs, label) {
-  const base = state.path, jobs = []; let skipped = 0, bytes = 0;
+  const base = state.path, jobs = []; let skipped = 0, bytes = 0, already = 0;
+  // Files already in the vault at the same path with the same name and size are skipped,
+  // so re-uploading a folder after an interrupted upload only sends what is missing.
+  const have = new Set();
+  for (const it of tg.items.values()) if (it.enc && it.meta && it.meta.k !== 'folder') have.add(`${it.meta.p || ''}\u0000${it.meta.n}\u0000${it.meta.s}`);
   for (const { file, dir } of files) {
     if (JUNK.has(file.name.toLowerCase())) { skipped++; continue; }
     if (dir && isJunkPath(dir)) { skipped++; continue; }
     const p = joinPath(base, dir); if (!pathOk(p)) { skipped++; continue; }
+    if (have.has(`${p}\u0000${file.name.slice(0, 200)}\u0000${file.size}`)) { already++; continue; }
     jobs.push({ file, path: p }); bytes += file.size;
   }
   const filled = new Set(jobs.map((j) => j.path));
@@ -571,9 +577,10 @@ function uploadTree(files, dirs, label) {
   const empty = [...new Set(dirs.filter((d) => !isJunkPath(d)).map((d) => joinPath(base, d)))]
     .filter((p) => pathOk(p) && ![...filled].some((f) => f === p || f.startsWith(p + '/')) && !allFolders().includes(p));
   const keptEmpty = empty.filter((p) => !empty.some((q) => q.startsWith(p + '/'))); // deepest only; parents follow from them
-  if (!jobs.length && !keptEmpty.length) return toast(skipped ? 'Nothing to upload — the folder paths are too long.' : 'That folder is empty.');
+  if (!jobs.length && !keptEmpty.length) return toast(already ? `All ${already} file(s) are already in the vault — nothing to upload.` : skipped ? 'Nothing to upload — the folder paths are too long.' : 'That folder is empty.');
   const msg = `Upload ${jobs.length} file(s) (${fmtSize(bytes)}) from “${label}” into ${placeName(base)}?`
     + `\n\nSubfolders are kept. Everything is encrypted before it leaves this browser. Keep this tab open until it finishes.`
+    + (already ? `\n\n${already} file(s) are already uploaded and will be skipped.` : '')
     + (skipped ? `\n\n${skipped} file(s) are nested too deeply and will be skipped.` : '');
   if (!confirm(msg)) return;
   enqueue([...keptEmpty.map((p) => ({ folder: p })), ...jobs]);
@@ -915,6 +922,8 @@ async function doLogout() {
       // Load pages one at a time with a short pause so the connection stays free for preview downloads
       const loadAll = async () => {
         try {
+          // First catch up on anything newer than the cache (uploads from last time, other devices)
+          if (await tg.syncNew()) { await tg._decryptMetas(); tg.onChange(); }
           while (tg.hasMore) { await tg.loadMore(); await new Promise((r) => setTimeout(r, 400)); }
         } catch { /* non-fatal */ } finally { indicator.remove(); }
       };

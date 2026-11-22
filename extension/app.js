@@ -70333,12 +70333,34 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
     get hasMore() {
       return !(this.cursors.doc.done && this.cursors.photo.done);
     }
+    /** Fetch every message newer than the newest one we already know (e.g. uploaded since the cache was saved,
+     *  or from another device). Pages from the newest down until it reaches known ground. */
+    async syncNew() {
+      let known = 0;
+      for (const id of this.items.keys()) if (id > known) known = id;
+      let added = 0;
+      for (const filter of [new import_telegram.Api.InputMessagesFilterDocument(), new import_telegram.Api.InputMessagesFilterPhotos()]) {
+        let off = 0;
+        for (; ; ) {
+          const msgs = await this.client.getMessages("me", { limit: 100, offsetId: off, minId: known, filter });
+          for (const m of msgs) if (m && m.id > known && this._ingest(m)) added++;
+          if (msgs.length < 100) break;
+          off = msgs[msgs.length - 1].id;
+          if (off <= known) break;
+        }
+      }
+      return added;
+    }
+    /** Save the file list cache, at most once every 2 s during bursts (e.g. a batch of uploads). */
+    saveCacheSoon() {
+      if (this._saveTimer) return;
+      this._saveTimer = setTimeout(() => {
+        this._saveTimer = null;
+        this.saveCache();
+      }, 2e3);
+    }
     async refresh() {
-      const [d, p] = await Promise.all([
-        this.client.getMessages("me", { limit: 100, filter: new import_telegram.Api.InputMessagesFilterDocument() }),
-        this.client.getMessages("me", { limit: 100, filter: new import_telegram.Api.InputMessagesFilterPhotos() })
-      ]);
-      for (const m of [...d, ...p]) this._ingest(m);
+      await this.syncNew();
       const ids = [...this.items.keys()];
       for (let i = 0; i < ids.length; i += 100) {
         const slice = ids.slice(i, i + 100);
@@ -71567,6 +71589,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     };
     let renderTimer = null;
     tg.onChange = () => {
+      tg.saveCacheSoon();
       if (state.path !== shownPath) {
         clearTimeout(renderTimer);
         renderTimer = null;
@@ -71618,7 +71641,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     }
   });
   addEventListener("beforeunload", (e) => {
-    if (activeJobs > 0) {
+    if (activeJobs > 0 || pending.length > 0) {
       e.preventDefault();
       e.returnValue = "";
     }
@@ -71666,7 +71689,9 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
   }
   function uploadTree(files, dirs, label) {
     const base = state.path, jobs = [];
-    let skipped = 0, bytes = 0;
+    let skipped = 0, bytes = 0, already = 0;
+    const have = /* @__PURE__ */ new Set();
+    for (const it of tg.items.values()) if (it.enc && it.meta && it.meta.k !== "folder") have.add(`${it.meta.p || ""}\0${it.meta.n}\0${it.meta.s}`);
     for (const { file, dir } of files) {
       if (JUNK.has(file.name.toLowerCase())) {
         skipped++;
@@ -71681,16 +71706,22 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
         skipped++;
         continue;
       }
+      if (have.has(`${p}\0${file.name.slice(0, 200)}\0${file.size}`)) {
+        already++;
+        continue;
+      }
       jobs.push({ file, path: p });
       bytes += file.size;
     }
     const filled = new Set(jobs.map((j) => j.path));
     const empty = [...new Set(dirs.filter((d) => !isJunkPath(d)).map((d) => joinPath(base, d)))].filter((p) => pathOk(p) && ![...filled].some((f) => f === p || f.startsWith(p + "/")) && !allFolders().includes(p));
     const keptEmpty = empty.filter((p) => !empty.some((q) => q.startsWith(p + "/")));
-    if (!jobs.length && !keptEmpty.length) return toast(skipped ? "Nothing to upload \u2014 the folder paths are too long." : "That folder is empty.");
+    if (!jobs.length && !keptEmpty.length) return toast(already ? `All ${already} file(s) are already in the vault \u2014 nothing to upload.` : skipped ? "Nothing to upload \u2014 the folder paths are too long." : "That folder is empty.");
     const msg = `Upload ${jobs.length} file(s) (${fmtSize(bytes)}) from \u201C${label}\u201D into ${placeName(base)}?
 
-Subfolders are kept. Everything is encrypted before it leaves this browser. Keep this tab open until it finishes.` + (skipped ? `
+Subfolders are kept. Everything is encrypted before it leaves this browser. Keep this tab open until it finishes.` + (already ? `
+
+${already} file(s) are already uploaded and will be skipped.` : "") + (skipped ? `
 
 ${skipped} file(s) are nested too deeply and will be skipped.` : "");
     if (!confirm(msg)) return;
@@ -72121,6 +72152,10 @@ ${skipped} file(s) are nested too deeply and will be skipped.` : "");
         document.body.appendChild(indicator);
         const loadAll = async () => {
           try {
+            if (await tg.syncNew()) {
+              await tg._decryptMetas();
+              tg.onChange();
+            }
             while (tg.hasMore) {
               await tg.loadMore();
               await new Promise((r) => setTimeout(r, 400));

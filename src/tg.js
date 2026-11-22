@@ -90,13 +90,32 @@ export class TG {
     this.saveCache(); // async, non-blocking
   }
   get hasMore() { return !(this.cursors.doc.done && this.cursors.photo.done); }
+  /** Fetch every message newer than the newest one we already know (e.g. uploaded since the cache was saved,
+   *  or from another device). Pages from the newest down until it reaches known ground. */
+  async syncNew() {
+    let known = 0;
+    for (const id of this.items.keys()) if (id > known) known = id;
+    let added = 0;
+    for (const filter of [new Api.InputMessagesFilterDocument(), new Api.InputMessagesFilterPhotos()]) {
+      let off = 0;
+      for (;;) {
+        const msgs = await this.client.getMessages('me', { limit: 100, offsetId: off, minId: known, filter });
+        for (const m of msgs) if (m && m.id > known && this._ingest(m)) added++;
+        if (msgs.length < 100) break;
+        off = msgs[msgs.length - 1].id;
+        if (off <= known) break;
+      }
+    }
+    return added;
+  }
+  /** Save the file list cache, at most once every 2 s during bursts (e.g. a batch of uploads). */
+  saveCacheSoon() {
+    if (this._saveTimer) return;
+    this._saveTimer = setTimeout(() => { this._saveTimer = null; this.saveCache(); }, 2000);
+  }
   async refresh() {
-    // pull newest page, then drop anything deleted elsewhere (phone/desktop)
-    const [d, p] = await Promise.all([
-      this.client.getMessages('me', { limit: 100, filter: new Api.InputMessagesFilterDocument() }),
-      this.client.getMessages('me', { limit: 100, filter: new Api.InputMessagesFilterPhotos() }),
-    ]);
-    for (const m of [...d, ...p]) this._ingest(m);
+    // pull everything new, then drop anything deleted elsewhere (phone/desktop)
+    await this.syncNew();
     const ids = [...this.items.keys()];
     for (let i = 0; i < ids.length; i += 100) {
       const slice = ids.slice(i, i + 100);
