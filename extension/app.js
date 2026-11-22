@@ -70451,7 +70451,50 @@ destroy_session#e7512126 session_id:long = DestroySessionRes;
     }
     async clearCache() {
       try {
-        await chrome.storage.local.remove(this._cacheKey());
+        const all = await chrome.storage.local.get(null);
+        const prefix = "th_" + (this.userId || "anon") + "_";
+        const keys = [this._cacheKey(), ...Object.keys(all).filter((k) => k.startsWith(prefix))];
+        await chrome.storage.local.remove(keys);
+      } catch {
+      }
+    }
+    // ---------- thumbnail disk cache ----------
+    // Thumbnails are stored encrypted, one key per item: "th_<userId>_<id>"
+    // Value: sealString(master, base64(jpegBytes))
+    // Each entry is small (~8-15 KB sealed), so 400 thumbnails ≈ 4-6 MB total.
+    _thumbKey(id) {
+      return "th_" + (this.userId || "anon") + "_" + id;
+    }
+    async loadThumbCache(ids) {
+      if (!this.master) return /* @__PURE__ */ new Map();
+      const result = /* @__PURE__ */ new Map();
+      try {
+        const keys = ids.map((id) => this._thumbKey(id));
+        const stored = await chrome.storage.local.get(keys);
+        for (const id of ids) {
+          const val = stored[this._thumbKey(id)];
+          if (!val) continue;
+          try {
+            const b642 = await openString(this.master, val);
+            const bytes = Uint8Array.from(atob(b642), (c) => c.charCodeAt(0));
+            result.set(id, new Blob([bytes], { type: "image/jpeg" }));
+          } catch {
+          }
+        }
+      } catch {
+      }
+      return result;
+    }
+    async saveThumbCache(id, blob) {
+      if (!this.master || !this.userId) return;
+      try {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        let b642 = "";
+        for (let i = 0; i < bytes.length; i += 32768)
+          b642 += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
+        b642 = btoa(b642);
+        const sealed = await sealString(this.master, b642);
+        await chrome.storage.local.set({ [this._thumbKey(id)]: sealed });
       } catch {
       }
     }
@@ -71038,6 +71081,8 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
           imgEl.src = url;
           imgEl.hidden = false;
         }
+        tg.saveThumbCache(it.id, blob).catch(() => {
+        });
       }).catch(() => {
       }).finally(() => {
         thumbBusy--;
@@ -72012,6 +72057,17 @@ ${skipped} file(s) are nested too deeply and will be skipped.` : "");
       tg.startLive();
       const hadCache = await tg.loadCache();
       if (hadCache) {
+        const ids = [...tg.items.keys()];
+        tg.loadThumbCache(ids).then((cached) => {
+          for (const [id, blob] of cached) {
+            if (!thumbCache.has(id)) {
+              const url = URL.createObjectURL(blob);
+              thumbCache.set(id, url);
+            }
+          }
+          renderGrid();
+        }).catch(() => {
+        });
         showLibrary();
         const indicator = Object.assign(document.createElement("div"), {
           id: "cacheRefresh",

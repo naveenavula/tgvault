@@ -187,7 +187,54 @@ export class TG {
   }
 
   async clearCache() {
-    try { await chrome.storage.local.remove(this._cacheKey()); } catch { /* non-fatal */ }
+    try {
+      // Remove file list cache and all thumbnail cache chunks
+      const all = await chrome.storage.local.get(null);
+      const prefix = 'th_' + (this.userId || 'anon') + '_';
+      const keys = [this._cacheKey(), ...Object.keys(all).filter((k) => k.startsWith(prefix))];
+      await chrome.storage.local.remove(keys);
+    } catch { /* non-fatal */ }
+  }
+
+  // ---------- thumbnail disk cache ----------
+  // Thumbnails are stored encrypted, one key per item: "th_<userId>_<id>"
+  // Value: sealString(master, base64(jpegBytes))
+  // Each entry is small (~8-15 KB sealed), so 400 thumbnails ≈ 4-6 MB total.
+
+  _thumbKey(id) { return 'th_' + (this.userId || 'anon') + '_' + id; }
+
+  async loadThumbCache(ids) {
+    // Returns Map<id, Blob> for all ids that have a cached thumbnail
+    if (!this.master) return new Map();
+    const result = new Map();
+    try {
+      const keys = ids.map((id) => this._thumbKey(id));
+      const stored = await chrome.storage.local.get(keys);
+      for (const id of ids) {
+        const val = stored[this._thumbKey(id)];
+        if (!val) continue;
+        try {
+          const b64 = await openString(this.master, val);
+          const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+          result.set(id, new Blob([bytes], { type: 'image/jpeg' }));
+        } catch { /* corrupted entry — ignore */ }
+      }
+    } catch { /* non-fatal */ }
+    return result;
+  }
+
+  async saveThumbCache(id, blob) {
+    if (!this.master || !this.userId) return;
+    try {
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      // base64 encode
+      let b64 = '';
+      for (let i = 0; i < bytes.length; i += 0x8000)
+        b64 += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      b64 = btoa(b64);
+      const sealed = await sealString(this.master, b64);
+      await chrome.storage.local.set({ [this._thumbKey(id)]: sealed });
+    } catch { /* non-fatal — storage quota may be full */ }
   }
 
   // ---------- upload ----------

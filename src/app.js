@@ -178,8 +178,12 @@ function pumpThumbs() {
   while (thumbBusy < 8 && thumbQueue.length) {   // 8 concurrent thumbnail downloads
     const { it, imgEl } = thumbQueue.shift(); thumbBusy++;
     tg.thumbnail(it).then((blob) => {
-      if (!blob) return; const url = URL.createObjectURL(blob); thumbCache.set(it.id, url);
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      thumbCache.set(it.id, url);
       if (imgEl.isConnected) { imgEl.src = url; imgEl.hidden = false; }
+      // Persist encrypted to disk so it survives tab close
+      tg.saveThumbCache(it.id, blob).catch(() => {});
     }).catch(() => {}).finally(() => { thumbBusy--; pumpThumbs(); });
   }
 }
@@ -860,6 +864,19 @@ async function doLogout() {
     // Try the cache first so the library appears instantly.
     const hadCache = await tg.loadCache();
     if (hadCache) {
+      // Pre-populate in-memory thumbCache from encrypted disk cache so thumbnails
+      // appear immediately without any Telegram round-trips.
+      const ids = [...tg.items.keys()];
+      tg.loadThumbCache(ids).then((cached) => {
+        for (const [id, blob] of cached) {
+          if (!thumbCache.has(id)) {
+            const url = URL.createObjectURL(blob);
+            thumbCache.set(id, url);
+          }
+        }
+        // Re-render so cached thumbnails show before Telegram sync completes
+        renderGrid();
+      }).catch(() => {});
       showLibrary();
       // Refresh from Telegram in the background; show a subtle indicator while it runs.
       const indicator = Object.assign(document.createElement('div'), {
