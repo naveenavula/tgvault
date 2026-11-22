@@ -71538,7 +71538,18 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       e.returnValue = "";
     }
   });
-  var JUNK = /* @__PURE__ */ new Set([".ds_store", "thumbs.db", "desktop.ini"]);
+  var JUNK = /* @__PURE__ */ new Set([".ds_store", "thumbs.db", "desktop.ini", ".localized", ".spotlight-v100", ".trashes", ".fseventsd"]);
+  var JUNK_FOLDER_PATTERNS = [
+    /^imagemetadatastripper/i,
+    // Brave's metadata-stripping temp folder
+    /^\.tmp\./i,
+    /^__macosx$/i,
+    /^\.git$/i,
+    /^node_modules$/i,
+    /^\.cache$/i
+  ];
+  var isJunkSegment = (seg) => JUNK_FOLDER_PATTERNS.some((re) => re.test(seg));
+  var isJunkPath = (relPath) => relPath.split("/").some(isJunkSegment);
   function cleanSeg(seg) {
     const t = Array.from(String(seg).replace(/[\u0000-\u001f\/\\]+/g, " ").trim().replace(/\s+/g, " ")).slice(0, 60).join("").trim();
     return t || "_";
@@ -71572,7 +71583,14 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
     const base = state.path, jobs = [];
     let skipped = 0, bytes = 0;
     for (const { file, dir } of files) {
-      if (JUNK.has(file.name.toLowerCase())) continue;
+      if (JUNK.has(file.name.toLowerCase())) {
+        skipped++;
+        continue;
+      }
+      if (dir && isJunkPath(dir)) {
+        skipped++;
+        continue;
+      }
       const p = joinPath(base, dir);
       if (!pathOk(p)) {
         skipped++;
@@ -71582,7 +71600,7 @@ button:disabled{opacity:.6;cursor:default}.err{color:#d64545;min-height:1.3em;ma
       bytes += file.size;
     }
     const filled = new Set(jobs.map((j) => j.path));
-    const empty = [...new Set(dirs.map((d) => joinPath(base, d)))].filter((p) => pathOk(p) && ![...filled].some((f) => f === p || f.startsWith(p + "/")) && !allFolders().includes(p));
+    const empty = [...new Set(dirs.filter((d) => !isJunkPath(d)).map((d) => joinPath(base, d)))].filter((p) => pathOk(p) && ![...filled].some((f) => f === p || f.startsWith(p + "/")) && !allFolders().includes(p));
     const keptEmpty = empty.filter((p) => !empty.some((q) => q.startsWith(p + "/")));
     if (!jobs.length && !keptEmpty.length) return toast(skipped ? "Nothing to upload \u2014 the folder paths are too long." : "That folder is empty.");
     const msg = `Upload ${jobs.length} file(s) (${fmtSize(bytes)}) from \u201C${label}\u201D into ${placeName(base)}?

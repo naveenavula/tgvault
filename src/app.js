@@ -499,7 +499,18 @@ addEventListener('beforeunload', (e) => { if (activeJobs > 0) { e.preventDefault
 
 // ---------- upload queue ----------
 // ---------- folder upload ----------
-const JUNK = new Set(['.ds_store', 'thumbs.db', 'desktop.ini']);
+const JUNK = new Set(['.ds_store', 'thumbs.db', 'desktop.ini', '.localized', '.spotlight-v100', '.trashes', '.fseventsd']);
+// Folder name patterns that are always browser/OS temp junk — matched case-insensitively against each path segment
+const JUNK_FOLDER_PATTERNS = [
+  /^imagemetadatastripper/i,   // Brave's metadata-stripping temp folder
+  /^\.tmp\./i,
+  /^__macosx$/i,
+  /^\.git$/i,
+  /^node_modules$/i,
+  /^\.cache$/i,
+];
+const isJunkSegment = (seg) => JUNK_FOLDER_PATTERNS.some((re) => re.test(seg));
+const isJunkPath = (relPath) => relPath.split('/').some(isJunkSegment);
 /** Folder names coming from disk: no slashes/control characters, max 60 characters (by letter, never cut mid-character). */
 function cleanSeg(seg) {
   const t = Array.from(String(seg).replace(/[\u0000-\u001f\/\\]+/g, ' ').trim().replace(/\s+/g, ' ')).slice(0, 60).join('').trim();
@@ -527,13 +538,14 @@ async function collectEntries(entries) {
 function uploadTree(files, dirs, label) {
   const base = state.path, jobs = []; let skipped = 0, bytes = 0;
   for (const { file, dir } of files) {
-    if (JUNK.has(file.name.toLowerCase())) continue;
+    if (JUNK.has(file.name.toLowerCase())) { skipped++; continue; }
+    if (dir && isJunkPath(dir)) { skipped++; continue; }
     const p = joinPath(base, dir); if (!pathOk(p)) { skipped++; continue; }
     jobs.push({ file, path: p }); bytes += file.size;
   }
   const filled = new Set(jobs.map((j) => j.path));
   // empty folders only need a marker; folders that hold files appear on their own
-  const empty = [...new Set(dirs.map((d) => joinPath(base, d)))]
+  const empty = [...new Set(dirs.filter((d) => !isJunkPath(d)).map((d) => joinPath(base, d)))]
     .filter((p) => pathOk(p) && ![...filled].some((f) => f === p || f.startsWith(p + '/')) && !allFolders().includes(p));
   const keptEmpty = empty.filter((p) => !empty.some((q) => q.startsWith(p + '/'))); // deepest only; parents follow from them
   if (!jobs.length && !keptEmpty.length) return toast(skipped ? 'Nothing to upload — the folder paths are too long.' : 'That folder is empty.');
